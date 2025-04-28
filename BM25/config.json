@@ -1,0 +1,7 @@
+{
+  "api_endpoint": "http://bioasq.org:8000/pubmed",
+  "num_candidates_per_combination": 1000,
+  "num_final_results": 10,
+  "debug_mode": true,
+  "debug_limit": 5
+}

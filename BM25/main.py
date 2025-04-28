@@ -1,5 +1,6 @@
 import os
 import sys # Import sys for exit
+import json # Import json for loading config
 
 # Import functions from our refactored modules using relative imports
 from keyword_extractor import extract_keyword_combinations
@@ -7,19 +8,27 @@ from api_client import call_bioasq_api_search
 from ranker import rank_articles_bm25
 from evaluation import load_ground_truth, calculate_precision_recall_f1, extract_pmid_from_url
 
-# --- Configuration ---
-# Define file paths relative to the script location
+# --- Configuration Loading ---
 script_dir = os.path.dirname(__file__) # Get the directory where the script is located
-# Construct the path assuming training13b.json is one level up from the script's directory
+config_filepath = os.path.join(script_dir, 'config.json')
 ground_truth_filepath = os.path.join(script_dir, '..', 'training13b.json')
 
-# !! REPLACE WITH ACTUAL TASK 13b ENDPOINT !!
-BIOASQ_API_ENDPOINT = "http://bioasq.org:8000/pubmed" # Placeholder
+try:
+    with open(config_filepath, 'r') as f:
+        config = json.load(f)
+except FileNotFoundError:
+    print(f"Error: Configuration file not found at {config_filepath}")
+    sys.exit(1)
+except json.JSONDecodeError:
+    print(f"Error: Could not decode JSON from {config_filepath}")
+    sys.exit(1)
 
-num_candidates_per_combination = 100
-num_final_results = 10 # This is 'k' for Precision@k, Recall@k
-debug_mode = True # Set to True to load only the first N items for debugging
-debug_limit = 5 # Number of questions to process in debug mode
+# --- Use loaded configuration ---
+BIOASQ_API_ENDPOINT = config.get("api_endpoint", "http://bioasq.org:8000/pubmed") # Provide default
+num_candidates_per_combination = config.get("num_candidates_per_combination", 100)
+num_final_results = config.get("num_final_results", 10)
+debug_mode = config.get("debug_mode", False)
+debug_limit = config.get("debug_limit", 5)
 
 # --- Main Orchestration ---
 

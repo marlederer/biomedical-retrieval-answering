@@ -6,12 +6,13 @@ from itertools import combinations
 # Download necessary NLTK data if not already present
 try:
     nltk.data.find('corpora/stopwords')
-except nltk.downloader.DownloadError:
+except Exception as e:
     nltk.download('stopwords', quiet=True)
 try:
     nltk.data.find('tokenizers/punkt')
-except nltk.downloader.DownloadError:
+except Exception as e:
     nltk.download('punkt', quiet=True)
+    nltk.download('punkt_tab', quiet=True)
 
 def extract_keyword_combinations(question_text):
     """Extracts single keywords, pairs, and triplets after simple splitting and stopword removal."""

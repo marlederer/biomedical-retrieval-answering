@@ -11,7 +11,7 @@ question_encoder = DPRQuestionEncoder.from_pretrained("facebook/dpr-question_enc
 question_tokenizer = DPRQuestionEncoderTokenizer.from_pretrained("facebook/dpr-question_encoder-single-nq-base")
 
 # Load context encoder and tokenizer
-context_encoder = DPRContextEncoder.from_pretrained("facebook/dpr-ctx_encoder-single-nq-base")
+context_encoder = DPRContextEncoder.from_pretrained("facebook/dpr-ctx_encoder-single-nq-base").to(device)
 context_tokenizer = DPRContextEncoderTokenizer.from_pretrained("facebook/dpr-ctx_encoder-single-nq-base")
 
 # Example question and context
@@ -24,11 +24,11 @@ abstract = "Hypertension is often caused by a combination of genetic and lifesty
 context = "Title: "+ title + " Abstract: " + abstract
 
 # Tokenize and encode the question
-question_inputs = question_tokenizer(question, return_tensors="pt")
+question_inputs = question_tokenizer(question, return_tensors="pt").to(device)
 question_embedding = question_encoder(**question_inputs).pooler_output  # Shape: [1, hidden_size]
 
 # Tokenize and encode the passage
-context_inputs = context_tokenizer(context, return_tensors="pt")
+context_inputs = context_tokenizer(context, return_tensors="pt").to(device)
 context_embedding = context_encoder(**context_inputs).pooler_output  # Shape: [1, hidden_size]
 
 # Compute cosine similarity

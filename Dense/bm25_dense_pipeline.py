@@ -2,11 +2,17 @@ import os
 import sys # Import sys for exit
 import json # Import json for loading config
 
+# Add BM25 folder to the Python path
+current_dir = os.path.dirname(os.path.abspath(__file__))
+bm25_dir = os.path.join(current_dir, '..', 'BM25')
+sys.path.append(bm25_dir)
+
 # Import functions from our refactored modules using relative imports
 from keyword_extractor import extract_keyword_combinations
 from api_client import call_bioasq_api_search
 from ranker import rank_articles_bm25
 from evaluation import load_ground_truth, calculate_precision_recall_f1, extract_pmid_from_url
+from dense_retrieval import encode_contexts, encode_query, rank_with_dense_retrieval
 
 # --- Configuration Loading ---
 script_dir = os.path.dirname(__file__) # Get the directory where the script is located
@@ -26,9 +32,11 @@ except json.JSONDecodeError:
 # --- Use loaded configuration ---
 BIOASQ_API_ENDPOINT = config.get("api_endpoint", "http://bioasq.org:8000/pubmed") # Provide default
 num_candidates_per_combination = config.get("num_candidates_per_combination", 100)
+num_initial_bm25 = config.get("num_initial_bm25", 1000)  # NEW: how many BM25 results to keep
 num_final_results = config.get("num_final_results", 10)
 debug_mode = config.get("debug_mode", True)
 debug_limit = config.get("debug_limit", 2)
+print("num_initial_bm25: " + str(num_initial_bm25))
 
 # --- Main Orchestration ---
 
@@ -89,18 +97,34 @@ if __name__ == "__main__":
         if all_candidate_articles:
             print(f"Retrieved {len(all_candidate_articles)} unique candidate articles in total.")
 
-            # 3. Rank Candidates Locally using BM25
+            # Step 3: Rank Candidates with BM25
             print("Ranking candidates locally using BM25...")
-            # rank_articles_bm25 now returns PMIDs/IDs directly
-            final_top_pmids = rank_articles_bm25(question, all_candidate_articles, top_k=num_final_results)
+            bm25_top_pmids = rank_articles_bm25(question, all_candidate_articles, top_k=num_initial_bm25)
+
+            # Filter candidate articles to only BM25 top results
+            filtered_articles = [article for article in all_candidate_articles if article['pmid'] in bm25_top_pmids]
+
+            if not filtered_articles:
+                print("No articles passed BM25 filtering.")
+                continue
+
+            # Step 4: Re-rank with Dense Retrieval
+            print("Re-ranking candidates using Dense Retrieval...")
+            passages = [[article['title'],article['abstract']] for article in filtered_articles]
+            passage_embeddings = encode_contexts(passages)
+            query_embedding = encode_query(question)
+            dense_top_indices = rank_with_dense_retrieval(query_embedding, passage_embeddings, top_k=num_final_results)
+
+            # Final top PMIDs after dense re-ranking
+            final_top_pmids = [filtered_articles[idx]['pmid'] for idx in dense_top_indices]
 
             # Ensure ground truth PMIDs are strings for comparison
             relevant_pmids_str = set(map(str, relevant_pmids))
 
-            # 4. Evaluate Results
+            # 5. Evaluate Results
             precision, recall, f1 = calculate_precision_recall_f1(final_top_pmids, relevant_pmids_str)
 
-            # 5. Pretty Print Results & Evaluation
+            # 6. Pretty Print Results & Evaluation
             print("-" * 40)
             print(f"Final Top {num_final_results} ranked article PMIDs for question: {question}")
             print("-" * 40)

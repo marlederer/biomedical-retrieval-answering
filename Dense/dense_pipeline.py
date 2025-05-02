@@ -98,7 +98,7 @@ if __name__ == "__main__":
             # 3. Rank Candidates Locally using Dense Retrieval
             print("Ranking candidates locally using Dense Retrieval...")
             # 1. Encode candidates
-            passages = [article['title'] + " " + article['abstract'] for article in all_candidate_articles]
+            passages = [[article['title'],article['abstract']] for article in all_candidate_articles]
             passage_embeddings = encode_contexts(passages)
 
             # 2. Encode question

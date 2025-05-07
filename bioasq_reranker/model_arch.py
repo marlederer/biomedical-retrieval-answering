@@ -30,8 +30,8 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     
     # Test with a common model
-    model_name = "bert-base-uncased" # Use a smaller model for quick testing
-    # model_name = "microsoft/BiomedNLP-PubMedBERT-base-uncased-abstract-fulltext" # For actual use
+    # model_name = "bert-base-uncased" # Use a smaller model for quick testing
+    model_name = "microsoft/BiomedNLP-PubMedBERT-base-uncased-abstract-fulltext" # For actual use
 
     try:
         model = CrossEncoderReRanker(model_name)

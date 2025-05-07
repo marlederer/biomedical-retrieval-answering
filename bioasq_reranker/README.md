@@ -75,3 +75,13 @@ Negative Sampling: The current data_loader.py uses random negative sampling. For
 Corpus for Negatives: The current random negative sampling uses all snippets from the training data as a pseudo-corpus. A more robust approach would be to use a larger, more diverse corpus (e.g., all PubMed abstracts related to BioASQ).
 Computational Resources: Fine-tuning transformer models requires a GPU for reasonable training times.
 Full BioASQ Document Processing: This example primarily focuses on re-ranking provided snippets. For document-level re-ranking, you would need to process the full documents linked in the BioASQ data (often PubMed articles), potentially segmenting them into passages.
+
+
+## Running the files
+
+python generate_hard_negatives.py \
+    --bioasq_file data/training11b.json \
+    --output_file data/hard_negatives.json \
+    --top_k_retrieval 50 \
+    --num_hard_negatives_per_query 5
+

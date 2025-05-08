@@ -1,154 +1,252 @@
-import argparse
+# inference.py (with BioASQ API for candidate docs & document re-ranking)
 import os
 import json
 import logging
+from collections import defaultdict
+import time  # For polite API usage
 
 import torch
 from transformers import AutoTokenizer
+from api_client import call_bioasq_api_search  # Updated import
 
-from model_arch import CrossEncoderReRanker # Assuming model_arch.py contains your CrossEncoderReRanker class
+from model_arch import CrossEncoderReRanker  # Assuming model_arch.py contains your class
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(name)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-def rerank_passages(query, candidate_passages, model, tokenizer, device, max_seq_length=512, batch_size=16):
+# --- Hardcoded Inference Configuration ---
+INFERENCE_CONFIG = {
+    "model_path": "bioasq_reranker/saved_models/my_biomedbert_reranker_hardcoded",  # Path to your trained re-ranker model
+    "query": "What are the effective treatments for metastatic melanoma?",
+
+    # --- BioASQ API Parameters for Candidate Document Retrieval ---
+    "bioasq_api_endpoint": "http://bioasq.org:8000/pubmed",  
+    "pubmed_fetch_count": 10,  # Number of documents to fetch from PubMed as candidates
+
+    # --- Passage Generation Parameters ---
+    "passage_field_from_pubmed": "abstract",  # Use 'abstract' or 'title_abstract'
+                                             # 'full_text' is usually not available directly via simple Entrez fetch
+
+    # --- Re-ranker Model Parameters ---
+    "max_seq_length_passage": 256,
+    "batch_size_passage": 16,
+
+    # --- Document Score Aggregation ---
+    "aggregation_method": "max",  # 'max', 'avg_top_k_passages'
+    # "k_for_avg": 3
+}
+# --- End of Hardcoded Configuration ---
+
+def fetch_pubmed_articles(query_term, count=10, api_endpoint_url=None):
     """
-    Re-ranks a list of candidate passages for a given query using the trained model.
-    Returns a list of (passage, score) tuples, sorted by score in descending order.
+    Fetches article details (PMID, Title, Abstract) from PubMed for a given query
+    using the call_bioasq_api_search function.
     """
-    if not candidate_passages:
+    logger.info(f"Fetching {count} articles from BioASQ service for query: '{query_term}' using endpoint: {api_endpoint_url}")
+    
+    if not api_endpoint_url:
+        logger.error("BioASQ API endpoint URL not provided.")
         return []
 
-    model.eval()
-    scores = []
-    
-    # Process in batches for efficiency if many candidate_passages
-    for i in range(0, len(candidate_passages), batch_size):
-        batch_passages = candidate_passages[i:i+batch_size]
-        
-        inputs = tokenizer(
-            [query] * len(batch_passages), # Repeat query for each passage in batch
-            batch_passages,
-            padding=True,
-            truncation='only_second', # Truncate passage if query+passage > max_length
-            max_length=max_seq_length,
-            return_tensors="pt"
+    try:
+        # Directly call the API function
+        # The call_bioasq_api_search function is expected to return a list of dictionaries:
+        # [{"id": pmid, "url": url, "title": title, "abstract": abstract_text}, ...]
+        articles_data_from_api = call_bioasq_api_search(
+            query_keywords=query_term,
+            num_articles_to_fetch=count,
+            api_endpoint_url=api_endpoint_url
         )
-        
+
+        if not articles_data_from_api:
+            logger.warning(f"No articles found via BioASQ service for query: '{query_term}'")
+            return []
+
+        # Transform the data to the expected format for the rest of the script
+        candidate_docs_from_pubmed = []
+        for article in articles_data_from_api:
+            candidate_docs_from_pubmed.append({
+                "doc_id": article.get("id"),  # Map 'id' to 'doc_id'
+                "title": article.get("title", ""),
+                "abstract": article.get("abstract", ""),
+                "url": article.get("url", "")  # Keep URL if needed later
+            })
+
+    except Exception as e:
+        logger.error(f"Error fetching from BioASQ service: {e}")
+        return []  # Return empty list on error
+    
+    logger.info(f"Fetched {len(candidate_docs_from_pubmed)} candidate documents from BioASQ service.")
+    return candidate_docs_from_pubmed
+
+
+def split_document_into_passages(doc_text, max_passage_tokens=200, stride=100, tokenizer_for_len_check=None):
+    passages = []
+    if not doc_text: return passages
+    if tokenizer_for_len_check:
+        tokens = tokenizer_for_len_check.tokenize(doc_text)
+        current_pos = 0
+        while current_pos < len(tokens):
+            end_pos = min(current_pos + max_passage_tokens, len(tokens))
+            passage_tokens = tokens[current_pos:end_pos]
+            passages.append(tokenizer_for_len_check.convert_tokens_to_string(passage_tokens))
+            if end_pos == len(tokens): break
+            current_pos += (max_passage_tokens - stride)
+            if current_pos >= end_pos: current_pos = end_pos
+    else:
+        words = doc_text.split()
+        current_pos = 0
+        while current_pos < len(words):
+            end_pos = min(current_pos + max_passage_tokens, len(words))
+            passage_words = words[current_pos:end_pos]
+            passages.append(" ".join(passage_words))
+            if end_pos == len(words): break
+            current_pos += (max_passage_tokens - stride)
+            if current_pos >= end_pos: current_pos = end_pos
+    return [p for p in passages if p.strip()]
+
+
+def rerank_individual_passages(query, passages, model, tokenizer, device, max_seq_length, batch_size):
+    if not passages: return []
+    model.eval()
+    all_passage_scores = []
+    for i in range(0, len(passages), batch_size):
+        batch_passage_texts = passages[i:i+batch_size]
+        inputs = tokenizer(
+            [query] * len(batch_passage_texts), batch_passage_texts, padding=True,
+            truncation='only_second', max_length=max_seq_length, return_tensors="pt"
+        )
         input_ids = inputs['input_ids'].to(device)
         attention_mask = inputs['attention_mask'].to(device)
-
         with torch.no_grad():
             logits = model(input_ids, attention_mask)
-            # If using BCEWithLogitsLoss during training, logits are raw scores.
-            # Higher logit = more relevant. Sigmoid can convert to probability if needed.
-            current_scores_tensor = logits.squeeze(-1) # Squeeze to remove last dim if it's 1
-            
-            # Option 1: Use raw logits for ranking (often fine)
-            current_scores = current_scores_tensor.cpu().numpy()
-            
-            # Option 2: Use probabilities (sigmoid of logits)
-            # current_scores = torch.sigmoid(current_scores_tensor).cpu().numpy()
+            scores_tensor = logits.squeeze(-1)
+            scores_numpy = scores_tensor.cpu().numpy()
+            for passage_text, score in zip(batch_passage_texts, scores_numpy):
+                all_passage_scores.append({"text": passage_text, "score": float(score)})
+    return all_passage_scores
 
-            scores.extend(current_scores)
 
-    scored_passages = list(zip(candidate_passages, scores))
-    # Sort by score in descending order (higher score means more relevant)
-    scored_passages.sort(key=lambda x: x[1], reverse=True)
-    return scored_passages
-
-def main():
-    parser = argparse.ArgumentParser(description="Re-rank passages using a trained BioASQ model.")
-    parser.add_argument("--model_path", type=str, required=True, help="Path to the directory containing the saved model (pytorch_model.bin, config.json, tokenizer files)")
-    parser.add_argument("--query", type=str, required=True, help="The query string")
-    parser.add_argument("--passages", nargs='+', required=True, help="List of candidate passages (strings)")
-    parser.add_argument("--max_seq_length", type=int, default=None, help="Maximum sequence length for tokenization. Tries to load from training_args.json if not set.")
-    parser.add_argument("--batch_size", type=int, default=16, help="Batch size for inference")
-
-    args = parser.parse_args()
-
+def run_document_inference_with_pubmed(config):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"Using device: {device}")
 
-    # --- Load Model and Tokenizer ---
-    if not os.path.exists(args.model_path) or \
-       not os.path.exists(os.path.join(args.model_path, "pytorch_model.bin")) or \
-       not os.path.exists(os.path.join(args.model_path, "config.json")): # Check for essential files
-        logger.error(f"Model path {args.model_path} does not seem to contain a valid saved model. "
-                     "Ensure pytorch_model.bin, config.json, and tokenizer files are present.")
-        return
+    model_path_config = config["model_path"]
+    max_seq_length_passage_config = config["max_seq_length_passage"]
+    bioasq_api_endpoint_config = config.get("bioasq_api_endpoint")  # Get BioASQ API endpoint
 
+    # --- Load Re-ranker Model and Tokenizer ---
     try:
-        # The tokenizer should have been saved with `save_pretrained` in the model_path
-        tokenizer = AutoTokenizer.from_pretrained(args.model_path)
-        
-        # We need the original model name or path to initialize AutoModel within CrossEncoderReRanker correctly
-        # Let's try to load it from training_args.json if available
+        tokenizer = AutoTokenizer.from_pretrained(model_path_config)
         original_model_name = None
-        training_args_path = os.path.join(args.model_path, "training_args.json")
-        if os.path.exists(training_args_path):
-            with open(training_args_path, 'r') as f:
-                train_args = json.load(f)
-            original_model_name = train_args.get("model_name")
-            if args.max_seq_length is None: # If not set by user, try to use from training
-                args.max_seq_length = train_args.get("max_seq_length", 512)
-
-
+        training_args_data = None
+        training_args_path_v1 = os.path.join(model_path_config, "training_args.json")
+        training_args_path_v2 = os.path.join(model_path_config, "training_config_hardcoded.json")
+        if os.path.exists(training_args_path_v1):
+            with open(training_args_path_v1, 'r') as f: training_args_data = json.load(f)
+        elif os.path.exists(training_args_path_v2):
+            with open(training_args_path_v2, 'r') as f: training_args_data = json.load(f)
+        if training_args_data: original_model_name = training_args_data.get("model_name")
         if not original_model_name:
-            logger.warning("Could not determine original base model name from training_args.json. "
-                           "The CrossEncoderReRanker might not load the BERT base correctly if it's not "
-                           "part of the state_dict. Ensure your model was saved to include base BERT weights "
-                           "or specify --bert_model_name if needed for a different loading strategy.")
-            # Fallback: assume the model_path itself can be used if it's a full Hugging Face model save
-            # This might not be true if only the state_dict of the CrossEncoderReRanker was saved
-            # without the base BERT model's name.
-            # For the current CrossEncoderReRanker, it needs the name of the BERT base.
-            # A robust way is to save the 'model_name' used during training.
-            # Let's assume the user provides a valid HF model identifier if training_args is missing.
-            # This part is tricky if only a state_dict is saved.
-            # The `model_arch.CrossEncoderReRanker` expects a HuggingFace model name for `AutoModel.from_pretrained`.
-            # So, the `model_path` for `AutoModel` should be the original base model name,
-            # and then we load the `state_dict` for the whole `CrossEncoderReRanker`.
-            # This is why saving `training_args.json` with `model_name` is crucial.
-            logger.error("Cannot determine the base BERT model name (e.g., from training_args.json). "
-                         "The CrossEncoderReRanker class needs this to initialize the BERT component. "
-                         "Please ensure 'model_name' is in training_args.json or modify inference script.")
+            logger.error("Cannot determine base BERT model name from training config.")
             return
 
-        model_state_dict_path = os.path.join(args.model_path, "pytorch_model.bin")
-        
-        model = CrossEncoderReRanker(model_name_or_path=original_model_name)
-        model.load_state_dict(torch.load(model_state_dict_path, map_location=device))
-        model.to(device)
-        logger.info(f"Model and tokenizer loaded successfully from {args.model_path} (using base: {original_model_name}).")
-
+        model_state_dict_path = os.path.join(model_path_config, "pytorch_model.bin")
+        passage_reranker_model = CrossEncoderReRanker(model_name_or_path=original_model_name)
+        passage_reranker_model.load_state_dict(torch.load(model_state_dict_path, map_location=device))
+        passage_reranker_model.to(device)
+        logger.info(f"Passage re-ranker model loaded successfully from {model_path_config}.")
     except Exception as e:
         logger.error(f"Error loading model or tokenizer: {e}")
         return
 
-    # --- Perform Re-ranking ---
-    if args.max_seq_length is None: # Fallback if still not set
-        args.max_seq_length = 512
-        logger.info(f"Using default max_seq_length: {args.max_seq_length}")
-
-    reranked_results = rerank_passages(
-        args.query,
-        args.passages,
-        model,
-        tokenizer,
-        device,
-        max_seq_length=args.max_seq_length,
-        batch_size=args.batch_size
+    # --- Fetch Candidate Documents from PubMed (via BioASQ service) ---
+    query_text = config["query"]
+    candidate_documents = fetch_pubmed_articles(
+        query_text,
+        count=config["pubmed_fetch_count"],
+        api_endpoint_url=bioasq_api_endpoint_config  # Pass BioASQ API endpoint
     )
+    if not candidate_documents:
+        logger.warning(f"No candidate documents fetched from BioASQ service for query '{query_text}'. Cannot proceed.")
+        print(f"\nQuery: {query_text}")
+        print("No documents found via BioASQ service for this query.")
+        return
+
+    # --- Process Candidate Documents (Re-ranking Logic) ---
+    passage_field = config["passage_field_from_pubmed"]  # Field to get text from PubMed results
+    document_scores = defaultdict(lambda: {"doc_id": "", "passages_scores": [], "aggregated_score": -float('inf'), "title": "", "original_doc_data": None})
+
+    logger.info(f"Re-ranking {len(candidate_documents)} documents fetched from BioASQ service...")
+
+    for doc_data in candidate_documents:
+        doc_id = doc_data["doc_id"]
+        doc_title = doc_data.get("title", "N/A")
+        document_scores[doc_id]["doc_id"] = doc_id
+        document_scores[doc_id]["title"] = doc_title
+        document_scores[doc_id]["original_doc_data"] = doc_data
+
+        text_to_process = ""
+        if passage_field == "abstract":
+            text_to_process = doc_data.get("abstract", "")
+        elif passage_field == "title_abstract":
+            title_text = doc_data.get("title", "")
+            abstract_text = doc_data.get("abstract", "")
+            text_to_process = f"{title_text}. {abstract_text}".strip()
+        else:
+            logger.warning(f"Unsupported passage_field_from_pubmed: {passage_field}. Defaulting to abstract.")
+            text_to_process = doc_data.get("abstract", "")
+
+        if not text_to_process.strip():
+            logger.warning(f"Document PMID {doc_id} ('{doc_title}') has no text for field '{passage_field}'. Assigning very low score.")
+            document_scores[doc_id]["aggregated_score"] = -float('inf')
+            document_scores[doc_id]["passages_scores"] = []
+            continue
+
+        doc_passages = [text_to_process]
+
+        if not doc_passages:
+            logger.warning(f"No passages generated for document {doc_id}. Skipping.")
+            document_scores[doc_id]["aggregated_score"] = -float('inf')
+            document_scores[doc_id]["passages_scores"] = []
+            continue
+
+        ranked_passages_for_doc = rerank_individual_passages(
+            query_text,
+            doc_passages,
+            passage_reranker_model,
+            tokenizer,
+            device,
+            max_seq_length=max_seq_length_passage_config,
+            batch_size=config["batch_size_passage"]
+        )
+        document_scores[doc_id]["passages_scores"] = ranked_passages_for_doc
+
+        if ranked_passages_for_doc:
+            if config["aggregation_method"] == "max":
+                document_scores[doc_id]["aggregated_score"] = max(p["score"] for p in ranked_passages_for_doc)
+            else:
+                document_scores[doc_id]["aggregated_score"] = max(p["score"] for p in ranked_passages_for_doc)
+        else:
+            document_scores[doc_id]["aggregated_score"] = -float('inf')
+
+    sorted_documents = sorted(document_scores.values(), key=lambda x: x["aggregated_score"], reverse=True)
 
     # --- Display Results ---
-    print(f"\nQuery: {args.query}")
-    print("Re-ranked Passages (higher score is more relevant):")
-    if reranked_results:
-        for i, (passage, score) in enumerate(reranked_results):
-            print(f"{i+1}. Score: {score:.4f}\tPassage: {passage}")
+    print(f"\nQuery: {query_text}")
+    print(f"Top {len(sorted_documents)} documents from BioASQ service, re-ranked (higher score is more relevant):")
+    if sorted_documents:
+        for i, doc_info in enumerate(sorted_documents):
+            pubmed_url = doc_info.get("url", f"https://pubmed.ncbi.nlm.nih.gov/{doc_info['doc_id']}/")
+            print(f"{i+1}. PMID: {doc_info['doc_id']} (Score: {doc_info['aggregated_score']:.4f}) - URL: {pubmed_url}")
+            print(f"    Title: {doc_info['title']}")
     else:
-        print("No passages were re-ranked (perhaps input was empty).")
+        print("No documents were re-ranked.")
 
 if __name__ == "__main__":
-    main()
+    if not INFERENCE_CONFIG.get("model_path") or not os.path.exists(INFERENCE_CONFIG["model_path"]):
+        logger.error(f"Model path '{INFERENCE_CONFIG.get('model_path')}' not configured or does not exist.")
+    elif not INFERENCE_CONFIG.get("bioasq_api_endpoint"):
+        logger.error("Please set your BioASQ API endpoint URL in the INFERENCE_CONFIG (bioasq_api_endpoint).")
+    else:
+        run_document_inference_with_pubmed(INFERENCE_CONFIG)

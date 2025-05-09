@@ -244,7 +244,12 @@ def run_document_inference_with_pubmed(config):
             document_scores[doc_id]["passages_scores"] = []
             continue
 
-        doc_passages = [text_to_process]
+        doc_passages = split_document_into_passages(
+            text_to_process,
+            max_passage_tokens=config.get("max_passage_tokens_split", 200),  # From INFERENCE_CONFIG
+            stride=config.get("passage_split_stride", 100),                 # From INFERENCE_CONFIG
+            tokenizer_for_len_check=tokenizer                               # Pass the loaded tokenizer
+        )
 
         if not doc_passages:
             logger.warning(f"No passages generated for document {doc_id}. Skipping.")
@@ -291,7 +296,7 @@ def run_document_inference_with_pubmed(config):
 if __name__ == "__main__":
     INFERENCE_CONFIG = {
         "model_path": "bioasq_reranker/saved_models/my_biomedbert_reranker_hardcoded",
-        "query": "What are the effective treatments for metastatic melanoma?",
+        "query": "What is the genetic basis of addiction?",
         "bioasq_api_endpoint": "http://bioasq.org:8000/pubmed", 
         "num_candidates_per_combination": 5,
         "passage_field_from_pubmed": "abstract",

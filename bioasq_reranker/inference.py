@@ -9,75 +9,115 @@ import torch
 from transformers import AutoTokenizer
 from api_client import call_bioasq_api_search  # Updated import
 
+# Attempt to import keyword_extractor and pmid extraction utility
+try:
+    from keyword_extractor import extract_keyword_combinations
+except ImportError:
+    from keyword_extractor import extract_keyword_combinations as local_extract_keyword_combinations
+    extract_keyword_combinations = local_extract_keyword_combinations
+
+
+def extract_pmid_from_url(url_string):
+    """
+    Extracts PubMed ID (PMID) from a URL string or if the string itself is a PMID.
+    Replace with your robust implementation.
+    """
+    if not url_string or not isinstance(url_string, str):
+        return None
+    url_lower = url_string.lower()
+    if "ncbi.nlm.nih.gov/pubmed/" in url_lower:
+        try:
+            return url_string.split("pubmed/")[1].split("/")[0].split("?")[0]
+        except IndexError:
+            pass
+    if url_string.isdigit():  # If the ID itself is passed
+        return url_string
+    return None
+
+
 from model_arch import CrossEncoderReRanker  # Assuming model_arch.py contains your class
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(name)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# --- Hardcoded Inference Configuration ---
-INFERENCE_CONFIG = {
-    "model_path": "bioasq_reranker/saved_models/my_biomedbert_reranker_hardcoded",  # Path to your trained re-ranker model
-    "query": "What are the effective treatments for metastatic melanoma?",
 
-    # --- BioASQ API Parameters for Candidate Document Retrieval ---
-    "bioasq_api_endpoint": "http://bioasq.org:8000/pubmed",  
-    "pubmed_fetch_count": 10,  # Number of documents to fetch from PubMed as candidates
-
-    # --- Passage Generation Parameters ---
-    "passage_field_from_pubmed": "abstract",  # Use 'abstract' or 'title_abstract'
-                                             # 'full_text' is usually not available directly via simple Entrez fetch
-
-    # --- Re-ranker Model Parameters ---
-    "max_seq_length_passage": 256,
-    "batch_size_passage": 16,
-
-    # --- Document Score Aggregation ---
-    "aggregation_method": "max",  # 'max', 'avg_top_k_passages'
-    # "k_for_avg": 3
-}
-# --- End of Hardcoded Configuration ---
-
-def fetch_pubmed_articles(query_term, count=10, api_endpoint_url=None):
+def fetch_documents_with_keyword_combinations(query, config):
     """
-    Fetches article details (PMID, Title, Abstract) from PubMed for a given query
-    using the call_bioasq_api_search function.
+    Fetches candidate documents from BioASQ using keyword combinations extracted from the query.
     """
-    logger.info(f"Fetching {count} articles from BioASQ service for query: '{query_term}' using endpoint: {api_endpoint_url}")
-    
+    api_endpoint_url = config.get("bioasq_api_endpoint")
+    num_candidates_per_combo = config.get("num_candidates_per_combination")
+
     if not api_endpoint_url:
-        logger.error("BioASQ API endpoint URL not provided.")
+        logger.error("BioASQ API endpoint ('bioasq_api_endpoint') not configured.")
+        return []
+    if num_candidates_per_combo is None:
+        logger.error("Number of candidates per combination ('num_candidates_per_combination') not configured.")
+        return []
+    if not isinstance(num_candidates_per_combo, int) or num_candidates_per_combo <= 0:
+        logger.error("'num_candidates_per_combination' must be a positive integer.")
         return []
 
+    logger.info(f"Extracting keyword combinations for query: {query[:100]}...")
     try:
-        # Directly call the API function
-        # The call_bioasq_api_search function is expected to return a list of dictionaries:
-        # [{"id": pmid, "url": url, "title": title, "abstract": abstract_text}, ...]
-        articles_data_from_api = call_bioasq_api_search(
-            query_keywords=query_term,
-            num_articles_to_fetch=count,
-            api_endpoint_url=api_endpoint_url
-        )
-
-        if not articles_data_from_api:
-            logger.warning(f"No articles found via BioASQ service for query: '{query_term}'")
-            return []
-
-        # Transform the data to the expected format for the rest of the script
-        candidate_docs_from_pubmed = []
-        for article in articles_data_from_api:
-            candidate_docs_from_pubmed.append({
-                "doc_id": article.get("id"),  # Map 'id' to 'doc_id'
-                "title": article.get("title", ""),
-                "abstract": article.get("abstract", ""),
-                "url": article.get("url", "")  # Keep URL if needed later
-            })
-
+        keyword_combinations_list = extract_keyword_combinations(query)
     except Exception as e:
-        logger.error(f"Error fetching from BioASQ service: {e}")
-        return []  # Return empty list on error
-    
-    logger.info(f"Fetched {len(candidate_docs_from_pubmed)} candidate documents from BioASQ service.")
-    return candidate_docs_from_pubmed
+        logger.error(f"Error during keyword extraction: {e}", exc_info=True)  # Log the full traceback
+        return []
+
+    if not keyword_combinations_list:
+        logger.warning(f"No keyword combinations extracted for query: '{query}'.")
+        return []
+
+    all_fetched_articles = []
+    seen_article_pmids = set()
+
+    logger.info(f"Fetching up to {num_candidates_per_combo} candidates per keyword combination from {api_endpoint_url} for {len(keyword_combinations_list)} combinations.")
+
+    for combo_idx, combo_keywords in enumerate(keyword_combinations_list):
+        current_query_str = " ".join(combo_keywords) if isinstance(combo_keywords, list) else combo_keywords
+        logger.info(f"Processing combination {combo_idx + 1}/{len(keyword_combinations_list)}: '{current_query_str}'")
+
+        try:
+            articles_data_from_api = call_bioasq_api_search(
+                query_keywords=current_query_str,
+                num_articles_to_fetch=num_candidates_per_combo,
+                api_endpoint_url=api_endpoint_url
+            )
+
+            if articles_data_from_api:
+                logger.debug(f"Retrieved {len(articles_data_from_api)} articles for combination '{current_query_str}'.")
+                for article_from_api in articles_data_from_api:
+                    if not isinstance(article_from_api, dict):
+                        logger.warning(f"Skipping non-dictionary item from API for combo '{current_query_str}': {article_from_api}")
+                        continue
+
+                    pmid_source_url = article_from_api.get('url', article_from_api.get('uri'))
+                    pmid_source_id = str(article_from_api.get('id', ''))
+
+                    pmid = extract_pmid_from_url(pmid_source_url) or extract_pmid_from_url(pmid_source_id)
+
+                    if pmid and pmid not in seen_article_pmids:
+                        fetched_article = {
+                            "doc_id": pmid,
+                            "title": article_from_api.get("title", ""),
+                            "abstract": article_from_api.get("abstract", ""),
+                            "url": article_from_api.get("url", f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/"),
+                            "original_api_response": article_from_api
+                        }
+                        all_fetched_articles.append(fetched_article)
+                        seen_article_pmids.add(pmid)
+                    elif pmid and pmid in seen_article_pmids:
+                        logger.debug(f"PMID {pmid} already seen, skipping.")
+                    elif not pmid:
+                        logger.warning(f"Could not extract PMID for combo '{current_query_str}'. URL: '{pmid_source_url}', ID: '{pmid_source_id}'. Data: {article_from_api}")
+            else:
+                logger.debug(f"No articles found for keyword combination: '{current_query_str}'")
+        except Exception as e:
+            logger.error(f"Error fetching or processing articles for combination '{current_query_str}': {e}")
+
+    logger.info(f"Fetched a total of {len(all_fetched_articles)} unique candidate articles after processing all keyword combinations.")
+    return all_fetched_articles
 
 
 def split_document_into_passages(doc_text, max_passage_tokens=200, stride=100, tokenizer_for_len_check=None):
@@ -133,9 +173,7 @@ def run_document_inference_with_pubmed(config):
 
     model_path_config = config["model_path"]
     max_seq_length_passage_config = config["max_seq_length_passage"]
-    bioasq_api_endpoint_config = config.get("bioasq_api_endpoint")  # Get BioASQ API endpoint
 
-    # --- Load Re-ranker Model and Tokenizer ---
     try:
         tokenizer = AutoTokenizer.from_pretrained(model_path_config)
         original_model_name = None
@@ -160,27 +198,30 @@ def run_document_inference_with_pubmed(config):
         logger.error(f"Error loading model or tokenizer: {e}")
         return
 
-    # --- Fetch Candidate Documents from PubMed (via BioASQ service) ---
     query_text = config["query"]
-    candidate_documents = fetch_pubmed_articles(
+
+    candidate_documents = fetch_documents_with_keyword_combinations(
         query_text,
-        count=config["pubmed_fetch_count"],
-        api_endpoint_url=bioasq_api_endpoint_config  # Pass BioASQ API endpoint
+        config
     )
+
     if not candidate_documents:
-        logger.warning(f"No candidate documents fetched from BioASQ service for query '{query_text}'. Cannot proceed.")
+        logger.warning(f"No candidate documents fetched using keyword combinations for query '{query_text}'. Cannot proceed.")
         print(f"\nQuery: {query_text}")
-        print("No documents found via BioASQ service for this query.")
+        print("No documents found using keyword combinations for this query.")
         return
 
-    # --- Process Candidate Documents (Re-ranking Logic) ---
-    passage_field = config["passage_field_from_pubmed"]  # Field to get text from PubMed results
+    passage_field = config.get("passage_field_from_pubmed", "abstract")
     document_scores = defaultdict(lambda: {"doc_id": "", "passages_scores": [], "aggregated_score": -float('inf'), "title": "", "original_doc_data": None})
 
-    logger.info(f"Re-ranking {len(candidate_documents)} documents fetched from BioASQ service...")
+    logger.info(f"Re-ranking {len(candidate_documents)} documents fetched using keyword combinations...")
 
     for doc_data in candidate_documents:
-        doc_id = doc_data["doc_id"]
+        doc_id = doc_data.get("doc_id")
+        if not doc_id:
+            logger.warning(f"Skipping document with no doc_id: {doc_data.get('title', 'N/A')}")
+            continue
+
         doc_title = doc_data.get("title", "N/A")
         document_scores[doc_id]["doc_id"] = doc_id
         document_scores[doc_id]["title"] = doc_title
@@ -211,6 +252,8 @@ def run_document_inference_with_pubmed(config):
             document_scores[doc_id]["passages_scores"] = []
             continue
 
+        batch_size_passage_config = config.get("batch_size_passage", 16)
+
         ranked_passages_for_doc = rerank_individual_passages(
             query_text,
             doc_passages,
@@ -218,23 +261,24 @@ def run_document_inference_with_pubmed(config):
             tokenizer,
             device,
             max_seq_length=max_seq_length_passage_config,
-            batch_size=config["batch_size_passage"]
+            batch_size=batch_size_passage_config
         )
         document_scores[doc_id]["passages_scores"] = ranked_passages_for_doc
 
+        aggregation_method = config.get("aggregation_method", "max")
         if ranked_passages_for_doc:
-            if config["aggregation_method"] == "max":
+            if aggregation_method == "max":
                 document_scores[doc_id]["aggregated_score"] = max(p["score"] for p in ranked_passages_for_doc)
             else:
+                logger.warning(f"Unsupported aggregation_method: {aggregation_method}. Defaulting to 'max'.")
                 document_scores[doc_id]["aggregated_score"] = max(p["score"] for p in ranked_passages_for_doc)
         else:
             document_scores[doc_id]["aggregated_score"] = -float('inf')
 
     sorted_documents = sorted(document_scores.values(), key=lambda x: x["aggregated_score"], reverse=True)
 
-    # --- Display Results ---
     print(f"\nQuery: {query_text}")
-    print(f"Top {len(sorted_documents)} documents from BioASQ service, re-ranked (higher score is more relevant):")
+    print(f"Top {len(sorted_documents)} documents fetched using keyword combinations, re-ranked (higher score is more relevant):")
     if sorted_documents:
         for i, doc_info in enumerate(sorted_documents):
             pubmed_url = doc_info.get("url", f"https://pubmed.ncbi.nlm.nih.gov/{doc_info['doc_id']}/")
@@ -243,10 +287,24 @@ def run_document_inference_with_pubmed(config):
     else:
         print("No documents were re-ranked.")
 
+
 if __name__ == "__main__":
-    if not INFERENCE_CONFIG.get("model_path") or not os.path.exists(INFERENCE_CONFIG["model_path"]):
-        logger.error(f"Model path '{INFERENCE_CONFIG.get('model_path')}' not configured or does not exist.")
-    elif not INFERENCE_CONFIG.get("bioasq_api_endpoint"):
-        logger.error("Please set your BioASQ API endpoint URL in the INFERENCE_CONFIG (bioasq_api_endpoint).")
+    INFERENCE_CONFIG = {
+        "model_path": "bioasq_reranker/saved_models/my_biomedbert_reranker_hardcoded",
+        "query": "What are the effective treatments for metastatic melanoma?",
+        "bioasq_api_endpoint": "http://bioasq.org:8000/pubmed", 
+        "num_candidates_per_combination": 5,
+        "passage_field_from_pubmed": "abstract",
+        "max_seq_length_passage": 512,
+        "batch_size_passage": 16,
+        "aggregation_method": "max",
+        "max_passage_tokens_split": 200,
+        "passage_split_stride": 100,
+    }
+
+    if not INFERENCE_CONFIG.get("bioasq_api_endpoint") or INFERENCE_CONFIG.get("bioasq_api_endpoint") == "YOUR_BIOASQ_API_ENDPOINT_URL":
+        logger.error("Please configure 'bioasq_api_endpoint' in INFERENCE_CONFIG.")
+    elif not INFERENCE_CONFIG.get("num_candidates_per_combination"):
+        logger.error("Please configure 'num_candidates_per_combination' in INFERENCE_CONFIG.")
     else:
         run_document_inference_with_pubmed(INFERENCE_CONFIG)

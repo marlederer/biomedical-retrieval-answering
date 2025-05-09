@@ -8,8 +8,9 @@ from tqdm import tqdm # Moved import to top
 import numpy as np
 import torch
 from torch.utils.data import DataLoader, random_split
+from torch.optim import AdamW # Changed import for AdamW
 
-from transformers import AdamW, get_linear_schedule_with_warmup
+from transformers import get_linear_schedule_with_warmup # AdamW removed from here
 
 from data_loader import (
     load_bioasq_json,
@@ -30,9 +31,9 @@ TRAINING_CONFIG = {
     # "hard_negatives_file": None, # Set to None if not using hard negatives
 
     "model_name": "microsoft/BiomedNLP-PubMedBERT-base-uncased-abstract-fulltext", # Hugging Face model
-    "output_dir": "saved_models/my_biomedbert_reranker_hardcoded", # Dir to save model
+    "output_dir": "bioasq_reranker/saved_models/my_biomedbert_reranker_hardcoded", # Dir to save model
 
-    "num_epochs": 3,
+    "num_epochs": 5,
     "batch_size": 8,
     "learning_rate": 2e-5,
     "max_seq_length": 512,
@@ -107,7 +108,7 @@ def train_model(config): # Renamed from train to avoid conflict, now takes confi
     passage_corpus = build_passage_corpus_from_bioasq(raw_questions_data)
     if not passage_corpus:
         logger.warning("Passage corpus could not be built or is empty.")
-        
+
     all_training_samples = create_training_samples(
         raw_questions_data,
         passage_corpus,
@@ -122,7 +123,7 @@ def train_model(config): # Renamed from train to avoid conflict, now takes confi
     num_samples = len(all_training_samples)
     val_size = int(config["val_split_ratio"] * num_samples)
     train_size = num_samples - val_size
-    
+
     if train_size <=0 or val_size <=0:
         logger.warning(f"Not enough samples for train/val split ({num_samples} total). Using all for training and skipping validation.")
         train_samples_list = all_training_samples
@@ -139,7 +140,7 @@ def train_model(config): # Renamed from train to avoid conflict, now takes confi
     val_dataset = None
     if val_samples_list:
         val_dataset = ReRankerDataset(val_samples_list, config["model_name"], config["max_seq_length"])
-    
+
     if len(train_dataset) == 0:
         logger.error("Train dataset is empty. Cannot proceed.")
         return
@@ -154,13 +155,14 @@ def train_model(config): # Renamed from train to avoid conflict, now takes confi
     model = CrossEncoderReRanker(config["model_name"])
     model.to(device)
 
+    # Use torch.optim.AdamW
     optimizer = AdamW(model.parameters(), lr=config["learning_rate"], eps=1e-8)
     criterion = torch.nn.BCEWithLogitsLoss()
 
     total_steps = len(train_dataloader) * config["num_epochs"]
     if total_steps == 0 and config["num_epochs"] > 0:
         logger.warning("Train dataloader is empty, but epochs > 0. Total steps will be 0.")
-    
+
     scheduler = get_linear_schedule_with_warmup(optimizer,
                                                 num_warmup_steps=int(0.05 * total_steps) if total_steps > 0 else 0,
                                                 num_training_steps=total_steps if total_steps > 0 else 1)
@@ -170,7 +172,7 @@ def train_model(config): # Renamed from train to avoid conflict, now takes confi
     logger.info(f"  Num epochs = {config['num_epochs']}")
     logger.info(f"  Batch size = {config['batch_size']}")
     logger.info(f"  Total optimization steps = {total_steps}")
-    
+
     if total_steps == 0 and config["num_epochs"] > 0:
         logger.error("Total optimization steps is 0. Training cannot proceed.")
         # Clean up dummy files if they were created by this run
@@ -186,7 +188,7 @@ def train_model(config): # Renamed from train to avoid conflict, now takes confi
     for epoch in range(config["num_epochs"]):
         model.train()
         total_train_loss = 0
-        
+
         progress_bar = tqdm(train_dataloader, desc=f"Epoch {epoch+1}/{config['num_epochs']} (Train)", disable=len(train_dataloader) == 0)
         for batch_idx, batch in enumerate(progress_bar):
             input_ids = batch['input_ids'].to(device)
@@ -225,7 +227,7 @@ def train_model(config): # Renamed from train to avoid conflict, now takes confi
             total_val_loss = 0
             all_preds_probs = []
             all_true_labels = []
-            
+
             logger.info(f"Running validation for Epoch {epoch+1}...")
             progress_bar_val = tqdm(val_dataloader, desc=f"Epoch {epoch+1}/{config['num_epochs']} (Val)")
             with torch.no_grad():

@@ -4,9 +4,9 @@ import json # Import json for loading config
 
 # Import functions from our refactored modules using relative imports
 from keyword_extractor import extract_keyword_combinations
-from api_client import call_bioasq_api_search
-from ranker import rank_articles_bm25
-from evaluation import calculate_precision_recall_f1, extract_pmid_from_url # Removed load_ground_truth as we load raw data here
+from api_client import search_pubmed, fetch_pubmed_details # Updated import
+from ranker import rank_articles_bm25, rank_snippets_bm25 # Added rank_snippets_bm25
+from evaluation import calculate_precision_recall_f1, extract_pmid_from_url
 
 # --- Configuration Loading ---
 script_dir = os.path.dirname(__file__) # Get the directory where the script is located
@@ -25,7 +25,7 @@ except json.JSONDecodeError:
     sys.exit(1)
 
 # --- Use loaded configuration ---
-BIOASQ_API_ENDPOINT = config.get("api_endpoint", "http://bioasq.org:8000/pubmed")
+# BIOASQ_API_ENDPOINT = config.get("api_endpoint", "http://bioasq.org:8000/pubmed") # Removed as we use direct PubMed functions
 num_candidates_per_combination = config.get("num_candidates_per_combination", 100)
 num_final_results = config.get("num_final_results", 10)
 debug_mode = config.get("debug_mode", False)
@@ -82,13 +82,19 @@ if __name__ == "__main__":
             seen_article_pmids = set()
 
             for combo in keyword_combinations_list:
-                candidate_articles_from_api = call_bioasq_api_search(combo, num_candidates_per_combination, BIOASQ_API_ENDPOINT)
+                # Updated API call to use search_pubmed and fetch_pubmed_details
+                pmids_from_search = search_pubmed(combo, max_results=num_candidates_per_combination)
+                candidate_articles_from_api = []
+                if pmids_from_search:
+                    candidate_articles_from_api = fetch_pubmed_details(pmids_from_search)
+                
                 if candidate_articles_from_api:
                     for article in candidate_articles_from_api:
-                        pmid = extract_pmid_from_url(article.get('url')) or extract_pmid_from_url(article.get('id'))
+                        pmid = article.get('id') # 'id' from fetch_pubmed_details is the PMID
                         if pmid and pmid not in seen_article_pmids:
-                            article['pmid'] = pmid
-                            if 'url' not in article or not article['url']: # Ensure URL is present
+                            article['pmid'] = pmid # Ensure 'pmid' key exists for downstream code
+                            # URL is already set by fetch_pubmed_details, no need to reconstruct unless missing
+                            if 'url' not in article or not article['url']:
                                 article['url'] = f"http://www.ncbi.nlm.nih.gov/pubmed/{pmid}"
                             all_candidate_articles.append(article)
                             seen_article_pmids.add(pmid)
@@ -149,17 +155,27 @@ if __name__ == "__main__":
         total_precision = 0
         total_recall = 0
         total_f1 = 0
+        total_snippet_precision = 0 # Added for snippet evaluation
+        total_snippet_recall = 0    # Added for snippet evaluation
+        total_snippet_f1 = 0        # Added for snippet evaluation
         processed_questions_count = 0
         questions_with_results = 0
 
-        print(f"\\nStarting evaluation for {len(input_questions_list)} questions...")
+        print(f"Starting evaluation for {len(input_questions_list)} questions...")
 
         for idx, input_question_obj in enumerate(input_questions_list):
             question_body = input_question_obj['body']
             relevant_doc_urls = input_question_obj.get('documents', [])
-            # Extract PMIDs from ground truth URLs, ensuring they are strings and non-empty
             relevant_pmids_str = {str(pmid) for url in relevant_doc_urls if (pmid := extract_pmid_from_url(url))}
-
+            
+            # Extract ground truth snippets
+            ideal_snippets_text = []
+            if 'snippets' in input_question_obj:
+                for snip in input_question_obj['snippets']:
+                    if isinstance(snip, dict) and 'text' in snip:
+                        ideal_snippets_text.append(snip['text'])
+                    elif isinstance(snip, str): # Legacy format where snippets might be just strings
+                        ideal_snippets_text.append(snip)
 
             print("-" * 40)
             print(f"Processing question ({idx + 1}/{len(input_questions_list)}): {question_body[:100]}...")
@@ -173,13 +189,21 @@ if __name__ == "__main__":
 
             for combo in keyword_combinations_list:
                 # print(f"  Fetching for combination: '{combo}'")
-                candidate_articles_from_api = call_bioasq_api_search(combo, num_candidates_per_combination, BIOASQ_API_ENDPOINT)
+                # Updated API call to use search_pubmed and fetch_pubmed_details
+                pmids_from_search = search_pubmed(combo, max_results=num_candidates_per_combination)
+                candidate_articles_from_api = []
+                if pmids_from_search:
+                    candidate_articles_from_api = fetch_pubmed_details(pmids_from_search)
+
                 if candidate_articles_from_api:
                     # print(f"    Retrieved {len(candidate_articles_from_api)} candidates for '{combo}'.")
                     for article in candidate_articles_from_api:
-                        pmid = extract_pmid_from_url(article.get('url')) or extract_pmid_from_url(article.get('id'))
+                        pmid = article.get('id') # 'id' from fetch_pubmed_details is the PMID
                         if pmid and pmid not in seen_article_ids:
-                            article['pmid'] = pmid
+                            article['pmid'] = pmid # Ensure 'pmid' key exists for downstream code
+                             # URL is already set by fetch_pubmed_details, no need to reconstruct unless missing
+                            if 'url' not in article or not article['url']:
+                                article['url'] = f"http://www.ncbi.nlm.nih.gov/pubmed/{pmid}"
                             all_candidate_articles.append(article)
                             seen_article_ids.add(pmid)
             
@@ -192,7 +216,15 @@ if __name__ == "__main__":
 
                 precision, recall, f1 = calculate_precision_recall_f1(final_top_pmids_str, relevant_pmids_str)
 
-                # ... (rest of the original pretty print and accumulation logic) ...
+                # Snippet Ranking and Evaluation
+                ranked_snippets_data = rank_snippets_bm25(question_body, all_candidate_articles, top_k=num_final_results) # Using num_final_results for snippets too
+                predicted_snippets_text = [snippet_data['snippet'] for snippet_data in ranked_snippets_data]
+                
+                # For snippet evaluation, we treat each snippet as a "document"
+                # We need to define how to match predicted snippets to ideal snippets (e.g., exact match, high overlap)
+                # For simplicity, using exact match here. More sophisticated matching might be needed.
+                snippet_precision, snippet_recall, snippet_f1 = calculate_precision_recall_f1(set(predicted_snippets_text), set(ideal_snippets_text))
+
                 print("-" * 40)
                 print(f"Final Top {num_final_results} ranked article PMIDs for question: {question_body[:100]}...")
                 final_top_urls = [f"http://www.ncbi.nlm.nih.gov/pubmed/{pmid}" for pmid in final_top_pmids_str]
@@ -212,9 +244,28 @@ if __name__ == "__main__":
                 print(f"Recall@{num_final_results}: {recall:.4f}")
                 print(f"F1-Score@{num_final_results}: {f1:.4f}")
 
+                print("-" * 40)
+                print(f"Top {num_final_results} ranked snippets for question: {question_body[:100]}...")
+                for i, snippet_data in enumerate(ranked_snippets_data, start=1):
+                    print(f"{i}. \"{snippet_data['snippet']}\" (Score: {snippet_data['score']:.4f}, PMID: {snippet_data['pmid']})")
+                print("-" * 40)
+                print(f"Ground truth snippets ({len(ideal_snippets_text)}):")
+                for i, ideal_snip in enumerate(sorted(list(set(ideal_snippets_text))), start=1):
+                    print(f"{i}. \"{ideal_snip}\"")
+                print("-" * 40)
+                overlap_snippets = set(predicted_snippets_text).intersection(set(ideal_snippets_text))
+                print(f"Overlap between ranked top K snippets and ideal snippets: {len(overlap_snippets)}")
+                print("-" * 40)
+                print(f"Snippet Precision@{num_final_results}: {snippet_precision:.4f}")
+                print(f"Snippet Recall@{num_final_results}: {snippet_recall:.4f}")
+                print(f"Snippet F1-Score@{num_final_results}: {snippet_f1:.4f}")
+
                 total_precision += precision
                 total_recall += recall
                 total_f1 += f1
+                total_snippet_precision += snippet_precision
+                total_snippet_recall += snippet_recall
+                total_snippet_f1 += snippet_f1
                 questions_with_results += 1
             else:
                 print("Failed to retrieve any candidate articles from the API for this question.")
@@ -229,9 +280,15 @@ if __name__ == "__main__":
             avg_precision = total_precision / questions_with_results
             avg_recall = total_recall / questions_with_results
             avg_f1 = total_f1 / questions_with_results
+            avg_snippet_precision = total_snippet_precision / questions_with_results
+            avg_snippet_recall = total_snippet_recall / questions_with_results
+            avg_snippet_f1 = total_snippet_f1 / questions_with_results
             print(f"Average Precision@{num_final_results}: {avg_precision:.4f}")
             print(f"Average Recall@{num_final_results}: {avg_recall:.4f}")
             print(f"Average F1-Score@{num_final_results}: {avg_f1:.4f}")
+            print(f"Average Snippet Precision@{num_final_results}: {avg_snippet_precision:.4f}")
+            print(f"Average Snippet Recall@{num_final_results}: {avg_snippet_recall:.4f}")
+            print(f"Average Snippet F1-Score@{num_final_results}: {avg_snippet_f1:.4f}")
             print(f"Metrics averaged over {questions_with_results} questions (out of {processed_questions_count} total processed) for which candidates were retrieved.")
         elif processed_questions_count > 0:
             print("No candidate articles were retrieved for any processed question where evaluation was attempted. Cannot calculate average metrics.")

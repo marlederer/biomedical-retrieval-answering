@@ -3,7 +3,7 @@ from preprocessing import preprocess_text_for_bm25 # Use relative import
 from evaluation import extract_pmid_from_url # Import helper
 import nltk # Added for sentence tokenization
 
-nltk.download('punkt_tab')
+nltk.download('punkt') # Corrected from punkt_tab
 
 
 def rank_articles_bm25(query_text, articles_data, top_k=10):
@@ -97,7 +97,5 @@ def rank_snippets_bm25(query_text, articles_data, top_k=10):
     # Sort sentences by score in descending order
     scored_sentences.sort(key=lambda x: x['score'], reverse=True)
 
-    # Return the text of the top_k snippets
-    top_snippets = [item['snippet'] for item in scored_sentences[:top_k]]
-    
-    return top_snippets
+    # Return the top_k scored sentence objects (metadata included)
+    return scored_sentences[:top_k]

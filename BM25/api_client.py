@@ -136,4 +136,3 @@ def call_bioasq_api_search(query_keywords, num_articles_to_fetch, api_endpoint_u
         # This case might be redundant if the inner try-except handles it, but keep for safety
         print(f"Error decoding API response (outer catch): {response.text if 'response' in locals() else 'No response object'}")
         return []
-

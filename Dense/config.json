@@ -2,9 +2,10 @@
     "api_endpoint": "http://bioasq.org:8000/pubmed",
     "num_candidates_per_combination": 100,
     "num_final_results": 10,
-    "debug_mode": true,
+    "debug_mode": false,
     "debug_limit": 100,
-    "output_mode": "json",
-    "input_questions_filepath": "../training13b.json"
+    "output_mode": "evaluation",
+    "input_questions_filepath": "../training13b.json",
+    "predictions_filepath": "bioasq_output_first100test.json"
   }
   

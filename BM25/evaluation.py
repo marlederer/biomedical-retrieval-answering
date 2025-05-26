@@ -71,3 +71,58 @@ def calculate_precision_recall_f1(retrieved_pmids, relevant_pmids):
     f1 = (2 * precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
 
     return precision, recall, f1
+
+def evaluate_predictions(predictions_filepath, ground_truth_filepath, debug_mode=False, debug_limit=5):
+    with open(predictions_filepath, 'r', encoding='utf-8') as f:
+        predictions_data = json.load(f)
+
+    ground_truth_data = load_ground_truth(ground_truth_filepath, debug_mode=debug_mode, debug_limit=debug_limit)
+
+    if not ground_truth_data:
+        print("Ground truth could not be loaded. Evaluation aborted.")
+        return
+
+    total_doc_precision = total_doc_recall = total_doc_f1 = 0.0
+    total_snip_precision = total_snip_recall = total_snip_f1 = 0.0
+    evaluated_count = 0
+
+    for item in predictions_data.get('questions', []):
+        question_body = item.get('body')
+        predicted_urls = item.get('documents', [])
+        predicted_pmids = {extract_pmid_from_url(url) for url in predicted_urls if extract_pmid_from_url(url)}
+        predicted_snips = set(s["text"] for s in item.get("snippets", []) if "text" in s)
+
+        if question_body in ground_truth_data:
+            gt = ground_truth_data[question_body]
+            relevant_pmids = gt["documents"]
+            relevant_snips = gt["snippets"]
+
+            doc_precision, doc_recall, doc_f1 = calculate_precision_recall_f1(predicted_pmids, relevant_pmids)
+            snip_precision, snip_recall, snip_f1 = calculate_precision_recall_f1(predicted_snips, relevant_snips)
+
+            print(f"Q: {question_body[:60]}...")
+            print(f"Documents - Precision: {doc_precision:.4f}, Recall: {doc_recall:.4f}, F1: {doc_f1:.4f}")
+            print(f"Snippets  - Precision: {snip_precision:.4f}, Recall: {snip_recall:.4f}, F1: {snip_f1:.4f}\n")
+
+            total_doc_precision += doc_precision
+            total_doc_recall += doc_recall
+            total_doc_f1 += doc_f1
+            total_snip_precision += snip_precision
+            total_snip_recall += snip_recall
+            total_snip_f1 += snip_f1
+            evaluated_count += 1
+
+    if evaluated_count > 0:
+        avg_doc_precision = total_doc_precision / evaluated_count
+        avg_doc_recall = total_doc_recall / evaluated_count
+        avg_doc_f1 = total_doc_f1 / evaluated_count
+
+        avg_snip_precision = total_snip_precision / evaluated_count
+        avg_snip_recall = total_snip_recall / evaluated_count
+        avg_snip_f1 = total_snip_f1 / evaluated_count
+
+        print("=== Overall Evaluation ===")
+        print(f"Document Retrieval - Avg Precision: {avg_doc_precision:.4f}, Recall: {avg_doc_recall:.4f}, F1: {avg_doc_f1:.4f}")
+        print(f"Snippet Retrieval  - Avg Precision: {avg_snip_precision:.4f}, Recall: {avg_snip_recall:.4f}, F1: {avg_snip_f1:.4f}")
+    else:
+        print("No questions matched for evaluation.")

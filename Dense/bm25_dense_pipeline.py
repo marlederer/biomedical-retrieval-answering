@@ -164,16 +164,6 @@ if __name__ == "__main__":
         print(f"\\nJSON output successfully written to {output_json_filepath}")
 
     elif output_mode == "evaluation":
-        #TODO load ground truh .json and prediction .json
-        with open(input_questions_filepath, "r", encoding="utf-8") as f_gold:
-            gold_data = json.load(f_gold)
-
-        with open(predictions_questions_filepath, "r", encoding="utf-8") as f_sys:
-            system_data = json.load(f_sys)
-
-        gold_questions = gold_data.get("questions", [])
-        system_questions = system_data.get("questions", [])
-
-        evaluate_documents_and_snippets(predictions_questions_filepath, input_questions_filepath,
+        evaluate_predictions(predictions_questions_filepath, input_questions_filepath,
                                         debug_mode=debug_mode, debug_limit=debug_limit)
             

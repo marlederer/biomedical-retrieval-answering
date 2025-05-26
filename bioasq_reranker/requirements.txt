@@ -1,5 +1,4 @@
-torch>=1.8.0
-transformers>=4.10.0
-scikit-learn>=0.24.0
-tqdm>=4.60.0
-numpy>=1.19.0
+torch
+nltk
+numpy
+tqdm

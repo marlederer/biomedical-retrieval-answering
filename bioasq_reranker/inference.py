@@ -1,315 +1,243 @@
-# inference.py (with BioASQ API for candidate docs & document re-ranking)
+'''
+Inference script for the KNRM reranker.
+
+This script loads a trained KNRM model, processes input data 
+(e.g., from BM25 or a dense retriever), reranks the documents, 
+and outputs the results in a structured format.
+'''
 import os
-import json
-import logging
-from collections import defaultdict
-import time  # For polite API usage
-
 import torch
-from transformers import AutoTokenizer
-from api_client import call_bioasq_api_search  # Updated import
+import json
+from tqdm import tqdm
+import argparse
+from collections import defaultdict
 
-# Attempt to import keyword_extractor and pmid extraction utility
-try:
-    from keyword_extractor import extract_keyword_combinations
-except ImportError:
-    from keyword_extractor import extract_keyword_combinations as local_extract_keyword_combinations
-    extract_keyword_combinations = local_extract_keyword_combinations
+import config
+from knrm import KNRM
+from data_loader import Vocabulary, get_inference_dataloader
+from metrics import calculate_mrr # For potential evaluation if ground truth is available
 
+def ensure_dir(directory):
+    if not os.path.exists(directory):
+        os.makedirs(directory)
 
-def extract_pmid_from_url(url_string):
-    """
-    Extracts PubMed ID (PMID) from a URL string or if the string itself is a PMID.
-    Replace with your robust implementation.
-    """
-    if not url_string or not isinstance(url_string, str):
-        return None
-    url_lower = url_string.lower()
-    if "ncbi.nlm.nih.gov/pubmed/" in url_lower:
-        try:
-            return url_string.split("pubmed/")[1].split("/")[0].split("?")[0]
-        except IndexError:
-            pass
-    if url_string.isdigit():  # If the ID itself is passed
-        return url_string
-    return None
-
-
-from model_arch import CrossEncoderReRanker  # Assuming model_arch.py contains your class
-
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(name)s - %(message)s')
-logger = logging.getLogger(__name__)
-
-
-def fetch_documents_with_keyword_combinations(query, config):
-    """
-    Fetches candidate documents from BioASQ using keyword combinations extracted from the query.
-    """
-    api_endpoint_url = config.get("bioasq_api_endpoint")
-    num_candidates_per_combo = config.get("num_candidates_per_combination")
-
-    if not api_endpoint_url:
-        logger.error("BioASQ API endpoint ('bioasq_api_endpoint') not configured.")
-        return []
-    if num_candidates_per_combo is None:
-        logger.error("Number of candidates per combination ('num_candidates_per_combination') not configured.")
-        return []
-    if not isinstance(num_candidates_per_combo, int) or num_candidates_per_combo <= 0:
-        logger.error("'num_candidates_per_combination' must be a positive integer.")
-        return []
-
-    logger.info(f"Extracting keyword combinations for query: {query[:100]}...")
+def rerank_documents(
+    model_path,
+    vocab_path,
+    input_retrieval_path, # Path to the output of BM25/Dense (e.g., bioasq_output.json)
+    output_reranked_path,
+    ground_truth_path=None # Optional: path to BioASQ JSON with ground truth for MRR calc
+):
+    print(f"Loading vocabulary from {vocab_path}...")
     try:
-        keyword_combinations_list = extract_keyword_combinations(query)
-    except Exception as e:
-        logger.error(f"Error during keyword extraction: {e}", exc_info=True)  # Log the full traceback
-        return []
-
-    if not keyword_combinations_list:
-        logger.warning(f"No keyword combinations extracted for query: '{query}'.")
-        return []
-
-    all_fetched_articles = []
-    seen_article_pmids = set()
-
-    logger.info(f"Fetching up to {num_candidates_per_combo} candidates per keyword combination from {api_endpoint_url} for {len(keyword_combinations_list)} combinations.")
-
-    for combo_idx, combo_keywords in enumerate(keyword_combinations_list):
-        current_query_str = " ".join(combo_keywords) if isinstance(combo_keywords, list) else combo_keywords
-        logger.info(f"Processing combination {combo_idx + 1}/{len(keyword_combinations_list)}: '{current_query_str}'")
-
-        try:
-            articles_data_from_api = call_bioasq_api_search(
-                query_keywords=current_query_str,
-                num_articles_to_fetch=num_candidates_per_combo,
-                api_endpoint_url=api_endpoint_url
-            )
-
-            if articles_data_from_api:
-                logger.debug(f"Retrieved {len(articles_data_from_api)} articles for combination '{current_query_str}'.")
-                for article_from_api in articles_data_from_api:
-                    if not isinstance(article_from_api, dict):
-                        logger.warning(f"Skipping non-dictionary item from API for combo '{current_query_str}': {article_from_api}")
-                        continue
-
-                    pmid_source_url = article_from_api.get('url', article_from_api.get('uri'))
-                    pmid_source_id = str(article_from_api.get('id', ''))
-
-                    pmid = extract_pmid_from_url(pmid_source_url) or extract_pmid_from_url(pmid_source_id)
-
-                    if pmid and pmid not in seen_article_pmids:
-                        fetched_article = {
-                            "doc_id": pmid,
-                            "title": article_from_api.get("title", ""),
-                            "abstract": article_from_api.get("abstract", ""),
-                            "url": article_from_api.get("url", f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/"),
-                            "original_api_response": article_from_api
-                        }
-                        all_fetched_articles.append(fetched_article)
-                        seen_article_pmids.add(pmid)
-                    elif pmid and pmid in seen_article_pmids:
-                        logger.debug(f"PMID {pmid} already seen, skipping.")
-                    elif not pmid:
-                        logger.warning(f"Could not extract PMID for combo '{current_query_str}'. URL: '{pmid_source_url}', ID: '{pmid_source_id}'. Data: {article_from_api}")
-            else:
-                logger.debug(f"No articles found for keyword combination: '{current_query_str}'")
-        except Exception as e:
-            logger.error(f"Error fetching or processing articles for combination '{current_query_str}': {e}")
-
-    logger.info(f"Fetched a total of {len(all_fetched_articles)} unique candidate articles after processing all keyword combinations.")
-    return all_fetched_articles
-
-
-def split_document_into_passages(doc_text, max_passage_tokens=200, stride=100, tokenizer_for_len_check=None):
-    passages = []
-    if not doc_text: return passages
-    if tokenizer_for_len_check:
-        tokens = tokenizer_for_len_check.tokenize(doc_text)
-        current_pos = 0
-        while current_pos < len(tokens):
-            end_pos = min(current_pos + max_passage_tokens, len(tokens))
-            passage_tokens = tokens[current_pos:end_pos]
-            passages.append(tokenizer_for_len_check.convert_tokens_to_string(passage_tokens))
-            if end_pos == len(tokens): break
-            current_pos += (max_passage_tokens - stride)
-            if current_pos >= end_pos: current_pos = end_pos
-    else:
-        words = doc_text.split()
-        current_pos = 0
-        while current_pos < len(words):
-            end_pos = min(current_pos + max_passage_tokens, len(words))
-            passage_words = words[current_pos:end_pos]
-            passages.append(" ".join(passage_words))
-            if end_pos == len(words): break
-            current_pos += (max_passage_tokens - stride)
-            if current_pos >= end_pos: current_pos = end_pos
-    return [p for p in passages if p.strip()]
-
-
-def rerank_individual_passages(query, passages, model, tokenizer, device, max_seq_length, batch_size):
-    if not passages: return []
-    model.eval()
-    all_passage_scores = []
-    for i in range(0, len(passages), batch_size):
-        batch_passage_texts = passages[i:i+batch_size]
-        inputs = tokenizer(
-            [query] * len(batch_passage_texts), batch_passage_texts, padding=True,
-            truncation='only_second', max_length=max_seq_length, return_tensors="pt"
-        )
-        input_ids = inputs['input_ids'].to(device)
-        attention_mask = inputs['attention_mask'].to(device)
-        with torch.no_grad():
-            logits = model(input_ids, attention_mask)
-            scores_tensor = logits.squeeze(-1)
-            scores_numpy = scores_tensor.cpu().numpy()
-            for passage_text, score in zip(batch_passage_texts, scores_numpy):
-                all_passage_scores.append({"text": passage_text, "score": float(score)})
-    return all_passage_scores
-
-
-def run_document_inference_with_pubmed(config):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    logger.info(f"Using device: {device}")
-
-    model_path_config = config["model_path"]
-    max_seq_length_passage_config = config["max_seq_length_passage"]
-
-    try:
-        tokenizer = AutoTokenizer.from_pretrained(model_path_config)
-        original_model_name = None
-        training_args_data = None
-        training_args_path_v1 = os.path.join(model_path_config, "training_args.json")
-        training_args_path_v2 = os.path.join(model_path_config, "training_config_hardcoded.json")
-        if os.path.exists(training_args_path_v1):
-            with open(training_args_path_v1, 'r') as f: training_args_data = json.load(f)
-        elif os.path.exists(training_args_path_v2):
-            with open(training_args_path_v2, 'r') as f: training_args_data = json.load(f)
-        if training_args_data: original_model_name = training_args_data.get("model_name")
-        if not original_model_name:
-            logger.error("Cannot determine base BERT model name from training config.")
-            return
-
-        model_state_dict_path = os.path.join(model_path_config, "pytorch_model.bin")
-        passage_reranker_model = CrossEncoderReRanker(model_name_or_path=original_model_name)
-        passage_reranker_model.load_state_dict(torch.load(model_state_dict_path, map_location=device))
-        passage_reranker_model.to(device)
-        logger.info(f"Passage re-ranker model loaded successfully from {model_path_config}.")
-    except Exception as e:
-        logger.error(f"Error loading model or tokenizer: {e}")
+        vocab = Vocabulary.load(vocab_path)
+    except FileNotFoundError:
+        print(f"ERROR: Vocabulary file not found at {vocab_path}. Please ensure it's created (e.g., by running train.py or data_loader.py first).")
         return
+    print(f"Vocabulary loaded. Size: {len(vocab)}")
 
-    query_text = config["query"]
+    print(f"Loading KNRM model from {model_path}...")
+    model = KNRM(
+        vocab_size=len(vocab),
+        embedding_dim=config.EMBEDDING_DIM,
+        n_kernels=config.N_KERNELS
+    ).to(config.DEVICE)
+    
+    try:
+        model.load_state_dict(torch.load(model_path, map_location=config.DEVICE))
+    except FileNotFoundError:
+        print(f"ERROR: Model file not found at {model_path}. Please train a model first.")
+        return
+    except Exception as e:
+        print(f"Error loading model state_dict: {e}")
+        print("This could be due to a mismatch in model architecture or a corrupted file.")
+        return
+        
+    model.eval()
+    print("Model loaded.")
 
-    candidate_documents = fetch_documents_with_keyword_combinations(
-        query_text,
-        config
+    print(f"Loading inference data from {input_retrieval_path}...")
+    inference_dataloader, query_doc_pairs_info = get_inference_dataloader(
+        input_retrieval_path, vocab, batch_size=config.BATCH_SIZE
     )
 
-    if not candidate_documents:
-        logger.warning(f"No candidate documents fetched using keyword combinations for query '{query_text}'. Cannot proceed.")
-        print(f"\nQuery: {query_text}")
-        print("No documents found using keyword combinations for this query.")
+    if not inference_dataloader:
+        print(f"Could not create inference dataloader. Check {input_retrieval_path}.")
         return
 
-    passage_field = config.get("passage_field_from_pubmed", "abstract")
-    document_scores = defaultdict(lambda: {"doc_id": "", "passages_scores": [], "aggregated_score": -float('inf'), "title": "", "original_doc_data": None})
+    print("Starting inference and reranking...")
+    results = [] # To store (query_id, doc_id, score, original_doc_text)
+    all_scores_for_pairs = [] # List of tuples (query_text, doc_text, score)
 
-    logger.info(f"Re-ranking {len(candidate_documents)} documents fetched using keyword combinations...")
+    with torch.no_grad():
+        progress_bar = tqdm(inference_dataloader, desc="Reranking")
+        for i, batch in enumerate(progress_bar):
+            query_ids = batch['query_ids'].to(config.DEVICE)
+            query_mask = batch['query_mask'].to(config.DEVICE)
+            doc_ids = batch['doc_ids'].to(config.DEVICE)
+            doc_mask = batch['doc_mask'].to(config.DEVICE)
+            
+            original_queries = batch['original_query']
+            original_docs = batch['original_doc']
 
-    for doc_data in candidate_documents:
-        doc_id = doc_data.get("doc_id")
-        if not doc_id:
-            logger.warning(f"Skipping document with no doc_id: {doc_data.get('title', 'N/A')}")
-            continue
+            scores = model(query_ids, doc_ids, query_mask, doc_mask)
+            scores = scores.squeeze(-1).cpu().tolist() # Squeeze and move to CPU
 
-        doc_title = doc_data.get("title", "N/A")
-        document_scores[doc_id]["doc_id"] = doc_id
-        document_scores[doc_id]["title"] = doc_title
-        document_scores[doc_id]["original_doc_data"] = doc_data
+            # The query_doc_pairs_info from get_inference_dataloader is flat.
+            # We need to map scores back to the correct (query_id, doc_id) from that flat list.
+            # The dataloader processes items sequentially, so we can use the batch index and size.
+            start_idx = i * config.BATCH_SIZE
+            for j in range(len(scores)):
+                current_pair_idx = start_idx + j
+                if current_pair_idx < len(query_doc_pairs_info):
+                    pair_info = query_doc_pairs_info[current_pair_idx]
+                    results.append({
+                        'query_id': pair_info['query_id'],
+                        'query_text': pair_info['query_text'],
+                        'doc_id': pair_info['doc_id'], # This is often a URL or a generated ID
+                        'doc_text': pair_info['doc_text'],
+                        'rerank_score': scores[j]
+                    })
+                    all_scores_for_pairs.append((pair_info['query_text'], pair_info['doc_text'], scores[j]))
+    
+    # Group results by query_id and sort documents by rerank_score
+    reranked_output_dict = defaultdict(list)
+    for res_item in results:
+        reranked_output_dict[res_item['query_id']].append(res_item)
 
-        text_to_process = ""
-        if passage_field == "abstract":
-            text_to_process = doc_data.get("abstract", "")
-        elif passage_field == "title_abstract":
-            title_text = doc_data.get("title", "")
-            abstract_text = doc_data.get("abstract", "")
-            text_to_process = f"{title_text}. {abstract_text}".strip()
-        else:
-            logger.warning(f"Unsupported passage_field_from_pubmed: {passage_field}. Defaulting to abstract.")
-            text_to_process = doc_data.get("abstract", "")
+    final_bioasq_structure = {"questions": []}
+    for q_id, doc_infos in reranked_output_dict.items():
+        # Sort documents for this query by the new rerank_score in descending order
+        sorted_doc_infos = sorted(doc_infos, key=lambda x: x['rerank_score'], reverse=True)
+        
+        # Reconstruct the BioASQ output format
+        # We need the original query body. We can get it from the first item (all items for a q_id have same query_text)
+        query_body = sorted_doc_infos[0]['query_text'] if sorted_doc_infos else ""
+        
+        question_output = {
+            "id": q_id,
+            "body": query_body,
+            "documents": [info['doc_id'] for info in sorted_doc_infos], # List of doc URLs/IDs
+            "snippets": [
+                {
+                    "document": info['doc_id'],
+                    "text": info['doc_text'],
+                    "score_reranked": info['rerank_score'] 
+                    # You might want to add original BM25/Dense score here if available in query_doc_pairs_info
+                } for info in sorted_doc_infos
+            ]
+        }
+        final_bioasq_structure["questions"].append(question_output)
 
-        if not text_to_process.strip():
-            logger.warning(f"Document PMID {doc_id} ('{doc_title}') has no text for field '{passage_field}'. Assigning very low score.")
-            document_scores[doc_id]["aggregated_score"] = -float('inf')
-            document_scores[doc_id]["passages_scores"] = []
-            continue
+    # Save the reranked results
+    ensure_dir(os.path.dirname(output_reranked_path))
+    with open(output_reranked_path, 'w', encoding='utf-8') as f:
+        json.dump(final_bioasq_structure, f, indent=4)
+    print(f"Reranked results saved to {output_reranked_path}")
 
-        doc_passages = split_document_into_passages(
-            text_to_process,
-            max_passage_tokens=config.get("max_passage_tokens_split", 200),  # From INFERENCE_CONFIG
-            stride=config.get("passage_split_stride", 100),                 # From INFERENCE_CONFIG
-            tokenizer_for_len_check=tokenizer                               # Pass the loaded tokenizer
-        )
+    # --- Optional: Calculate MRR if ground truth is provided ---
+    if ground_truth_path:
+        print(f"Calculating MRR@{config.MRR_K} using ground truth from {ground_truth_path}...")
+        try:
+            with open(ground_truth_path, 'r', encoding='utf-8') as f:
+                gt_data = json.load(f).get('questions', [])
+            
+            relevant_docs_map_gt = {}
+            for q_data in gt_data:
+                # Assuming ground truth relevant documents are identified by their URLs/IDs in 'documents' field
+                # and these IDs match what's in our 'doc_id' from the reranked results.
+                relevant_docs_map_gt[q_data['id']] = set(s['document'] for s in q_data.get('snippets',[]))
+                # Or, if your ground truth has a simpler list of doc IDs:
+                # relevant_docs_map_gt[q_data['id']] = set(q_data.get('documents', []))
 
-        if not doc_passages:
-            logger.warning(f"No passages generated for document {doc_id}. Skipping.")
-            document_scores[doc_id]["aggregated_score"] = -float('inf')
-            document_scores[doc_id]["passages_scores"] = []
-            continue
+            # Prepare ranked_lists for MRR calculation from our reranked output
+            ranked_lists_for_mrr = {}
+            for q_output in final_bioasq_structure['questions']:
+                ranked_lists_for_mrr[q_output['id']] = [doc_id for doc_id in q_output['documents']]
 
-        batch_size_passage_config = config.get("batch_size_passage", 16)
-
-        ranked_passages_for_doc = rerank_individual_passages(
-            query_text,
-            doc_passages,
-            passage_reranker_model,
-            tokenizer,
-            device,
-            max_seq_length=max_seq_length_passage_config,
-            batch_size=batch_size_passage_config
-        )
-        document_scores[doc_id]["passages_scores"] = ranked_passages_for_doc
-
-        aggregation_method = config.get("aggregation_method", "max")
-        if ranked_passages_for_doc:
-            if aggregation_method == "max":
-                document_scores[doc_id]["aggregated_score"] = max(p["score"] for p in ranked_passages_for_doc)
+            if not ranked_lists_for_mrr:
+                print("No reranked lists available to calculate MRR.")
+            elif not relevant_docs_map_gt:
+                print("No ground truth relevant documents loaded. Cannot calculate MRR.")
             else:
-                logger.warning(f"Unsupported aggregation_method: {aggregation_method}. Defaulting to 'max'.")
-                document_scores[doc_id]["aggregated_score"] = max(p["score"] for p in ranked_passages_for_doc)
+                mrr_score, _ = calculate_mrr(ranked_lists_for_mrr, relevant_docs_map_gt, k=config.MRR_K)
+                print(f"MRR@{config.MRR_K}: {mrr_score:.4f}")
+
+        except FileNotFoundError:
+            print(f"Ground truth file not found at {ground_truth_path}. Skipping MRR calculation.")
+        except Exception as e:
+            print(f"Error during MRR calculation: {e}")
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description="Rerank documents using a trained KNRM model.")
+    parser.add_argument("--model_path", type=str, default=config.SAVE_MODEL_PATH,
+                        help="Path to the trained KNRM model file (.pth)")
+    parser.add_argument("--vocab_path", type=str, default=config.VOCAB_PATH,
+                        help="Path to the vocabulary file (.json)")
+    parser.add_argument("--input_file", type=str, required=True,
+                        help="Path to the input file from a first-stage retriever (e.g., BM25 output JSON)")
+    parser.add_argument("--output_file", type=str, default="reranked_output/knrm_reranked_bioasq.json",
+                        help="Path to save the reranked output JSON")
+    parser.add_argument("--ground_truth_file", type=str, default=config.TRAIN_DATA_PATH, # Example: use train data for GT structure
+                        help="Optional: Path to the ground truth BioASQ JSON file for MRR calculation.")
+    
+    args = parser.parse_args()
+
+    # Create dummy files for a quick test if they don't exist
+    ensure_dir("data")
+    ensure_dir("models")
+    ensure_dir(os.path.dirname(args.output_file))
+
+    if not os.path.exists(args.vocab_path):
+        print(f"Warning: Dummy vocabulary created at {args.vocab_path} for inference script execution.")
+        dummy_vocab_data = {"word2idx": {"<pad>": 0, "<unk>": 1, "test": 2, "document":3 }, "idx2word": {"0": "<pad>", "1": "<unk>", "2": "test", "3": "document"}}
+        with open(args.vocab_path, 'w') as f:
+            json.dump(dummy_vocab_data, f)
+
+    if not os.path.exists(args.model_path):
+        print(f"Warning: Model path {args.model_path} does not exist. Inference will likely fail unless a model is placed there.")
+        # Cannot create a dummy model easily, user must train one.
+
+    # Check if input file exists, if not, try to use a default from config or make a dummy one
+    input_file_to_use = args.input_file
+    if not os.path.exists(input_file_to_use):
+        print(f"Warning: Specified input file {input_file_to_use} not found.")
+        # Try to use one of the default config paths if they exist
+        if os.path.exists(config.BM25_OUTPUT_PATH):
+            print(f"Using BM25 output from config: {config.BM25_OUTPUT_PATH}")
+            input_file_to_use = config.BM25_OUTPUT_PATH
+        elif os.path.exists(config.DENSE_OUTPUT_PATH):
+            print(f"Using Dense retriever output from config: {config.DENSE_OUTPUT_PATH}")
+            input_file_to_use = config.DENSE_OUTPUT_PATH
         else:
-            document_scores[doc_id]["aggregated_score"] = -float('inf')
+            print(f"Warning: Dummy input retrieval data created at 'dummy_retrieval_input.json' for inference script execution.")
+            dummy_retrieval_data = {"questions": [
+                {"id": "q1_infer", "body": "test query for inference", 
+                 "snippets": [{"text": "sample document one", "document": "doc_url_1"}, {"text": "sample document two", "document": "doc_url_2"}]}
+            ]}
+            input_file_to_use = "dummy_retrieval_input.json"
+            with open(input_file_to_use, 'w') as f:
+                json.dump(dummy_retrieval_data, f)
+    
+    # Ensure ground truth file exists if specified, or create a dummy one for testing structure
+    gt_file_to_use = args.ground_truth_file
+    if gt_file_to_use and not os.path.exists(gt_file_to_use):
+        if gt_file_to_use == config.TRAIN_DATA_PATH and os.path.exists(config.TRAIN_DATA_PATH):
+            pass # It will use the one from config
+        else:
+            print(f"Warning: Dummy ground truth data created at {gt_file_to_use} for MRR calculation structure test.")
+            dummy_gt_data = {"questions": [
+                {"id": "q1_infer", "body": "test query for inference", "documents": ["doc_url_1"], 
+                 "snippets": [{"text": "sample document one", "document": "doc_url_1"}] # Assuming doc_url_1 is relevant
+                }
+            ]}
+            with open(gt_file_to_use, 'w') as f:
+                json.dump(dummy_gt_data, f)
 
-    sorted_documents = sorted(document_scores.values(), key=lambda x: x["aggregated_score"], reverse=True)
-
-    print(f"\nQuery: {query_text}")
-    print(f"Top {len(sorted_documents)} documents fetched using keyword combinations, re-ranked (higher score is more relevant):")
-    if sorted_documents:
-        for i, doc_info in enumerate(sorted_documents):
-            pubmed_url = doc_info.get("url", f"https://pubmed.ncbi.nlm.nih.gov/{doc_info['doc_id']}/")
-            print(f"{i+1}. PMID: {doc_info['doc_id']} (Score: {doc_info['aggregated_score']:.4f}) - URL: {pubmed_url}")
-            print(f"    Title: {doc_info['title']}")
-    else:
-        print("No documents were re-ranked.")
-
-
-if __name__ == "__main__":
-    INFERENCE_CONFIG = {
-        "model_path": "bioasq_reranker/saved_models/my_biomedbert_reranker_hardcoded",
-        "query": "What is the genetic basis of addiction?",
-        "bioasq_api_endpoint": "http://bioasq.org:8000/pubmed", 
-        "num_candidates_per_combination": 5,
-        "passage_field_from_pubmed": "abstract",
-        "max_seq_length_passage": 512,
-        "batch_size_passage": 16,
-        "aggregation_method": "max",
-        "max_passage_tokens_split": 200,
-        "passage_split_stride": 100,
-    }
-
-    if not INFERENCE_CONFIG.get("bioasq_api_endpoint") or INFERENCE_CONFIG.get("bioasq_api_endpoint") == "YOUR_BIOASQ_API_ENDPOINT_URL":
-        logger.error("Please configure 'bioasq_api_endpoint' in INFERENCE_CONFIG.")
-    elif not INFERENCE_CONFIG.get("num_candidates_per_combination"):
-        logger.error("Please configure 'num_candidates_per_combination' in INFERENCE_CONFIG.")
-    else:
-        run_document_inference_with_pubmed(INFERENCE_CONFIG)
+    rerank_documents(
+        model_path=args.model_path,
+        vocab_path=args.vocab_path,
+        input_retrieval_path=input_file_to_use,
+        output_reranked_path=args.output_file,
+        ground_truth_path=gt_file_to_use
+    )

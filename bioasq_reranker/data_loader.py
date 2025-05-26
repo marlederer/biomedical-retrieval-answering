@@ -1,262 +1,370 @@
-# data_loader.py
+'''
+Data loading and processing for BioASQ reranking task.
+Handles loading BioASQ JSON, creating training triples, and preparing batches.
+'''
 import json
 import random
-from tqdm import tqdm
-import logging
-import os # Added os
-
 import torch
-from torch.utils.data import Dataset
-from transformers import AutoTokenizer
+from torch.utils.data import Dataset, DataLoader
 
-logger = logging.getLogger(__name__)
+import config
+from utils import tokenize_text, texts_to_sequences, pad_sequence, create_mask_from_sequence, Vocabulary
 
-def load_bioasq_json(filepath):
-    """Loads BioASQ JSON data."""
-    try:
-        with open(filepath, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-        logger.info(f"Successfully loaded BioASQ data from {filepath}")
-        return data.get('questions', [])
-    except FileNotFoundError:
-        logger.error(f"Error: BioASQ file not found at {filepath}. Please provide the correct path.")
-        return []
-    except json.JSONDecodeError:
-        logger.error(f"Error: Could not decode JSON from {filepath}. File might be corrupted.")
-        return []
-    except Exception as e:
-        logger.error(f"An unexpected error occurred while loading {filepath}: {e}")
-        return []
+class BioASQTripletDataset(Dataset):
+    '''
+    Dataset for training a reranker using query, relevant_doc, non_relevant_doc triples.
+    '''
+    def __init__(self, queries, relevant_docs, non_relevant_docs, vocab, 
+                 max_query_len=config.MAX_QUERY_LEN, max_doc_len=config.MAX_DOC_LEN):
+        self.queries = queries
+        self.relevant_docs = relevant_docs
+        self.non_relevant_docs = non_relevant_docs
+        self.vocab = vocab
+        self.max_query_len = max_query_len
+        self.max_doc_len = max_doc_len
 
-def build_passage_corpus_from_bioasq(questions_data, min_snippet_len=10):
-    """
-    Creates a list of unique passages (from snippets) to serve as a corpus for negative sampling.
-    """
-    all_passages = set()
-    if not questions_data:
-        logger.warning("No questions data provided to build passage corpus.")
-        return []
-
-    for q_entry in questions_data:
-        if 'snippets' in q_entry:
-            for snippet in q_entry['snippets']:
-                passage_text = snippet.get('text', '').strip()
-                if len(passage_text) >= min_snippet_len:
-                    all_passages.add(passage_text)
-    
-    corpus = list(all_passages)
-    if not corpus:
-        logger.warning("Passage corpus is empty. This might happen if snippets are missing or too short.")
-        return ["This is a fallback passage example.", "Another fallback text for corpus generation."]
-    
-    logger.info(f"Built a passage corpus with {len(corpus)} unique snippets.")
-    return corpus
-
-def load_hard_negatives(filepath):
-    """Loads pre-computed hard negatives from a JSON file."""
-    if not filepath or not os.path.exists(filepath):
-        logger.info("No hard negatives file provided or file does not exist. Will use random negatives only.")
-        return None
-    try:
-        with open(filepath, 'r', encoding='utf-8') as f:
-            hard_negatives_map = json.load(f) # Expected format: {"question_id": ["neg_passage1", ...]}
-        logger.info(f"Successfully loaded {len(hard_negatives_map)} question entries from hard negatives file: {filepath}")
-        return hard_negatives_map
-    except Exception as e:
-        logger.error(f"Error loading hard negatives from {filepath}: {e}")
-        return None
-
-def create_training_samples(questions_data,
-                            passage_corpus,
-                            num_neg_samples_per_positive=1,
-                            max_questions=None,
-                            hard_negatives_map=None): # Added hard_negatives_map
-    """
-    Creates training samples (query, passage, label, type) for the re-ranker.
-    Labels: 1 for positive, 0 for negative.
-    Type: 'positive', 'hard_negative', 'random_negative'.
-    """
-    train_samples = []
-    if not questions_data:
-        logger.warning("No questions data provided for creating training samples.")
-        return []
-    
-    # Fallback for passage_corpus if it's somehow empty (should be handled in build_passage_corpus_from_bioasq)
-    if not passage_corpus:
-        logger.warning("Passage corpus is empty. Random negative sampling will be ineffective.")
-        passage_corpus = ["Default random negative A.", "Default random negative B."]
-
-
-    question_subset = questions_data
-    if max_questions is not None and 0 < max_questions < len(questions_data):
-        logger.info(f"Using a subset of {max_questions} questions for training sample generation.")
-        # Ensure determinism if a seed is set elsewhere, or shuffle if desired for subset selection
-        # random.shuffle(questions_data) # Uncomment if random subset desired each time
-        question_subset = questions_data[:max_questions] # Or random.sample(questions_data, max_questions)
-
-
-    for q_entry in tqdm(question_subset, desc="Generating Training Samples"):
-        query_text = q_entry.get('body', '').strip()
-        q_id = q_entry.get('id') # Need question ID for hard negatives map
-
-        if not query_text or not q_id:
-            logger.warning(f"Skipping question with missing body or ID: {q_entry}")
-            continue
-
-        positive_passages_texts = []
-        if 'snippets' in q_entry:
-            for snippet in q_entry['snippets']:
-                passage_text = snippet.get('text', '').strip()
-                if passage_text:
-                    positive_passages_texts.append(passage_text)
-        
-        if not positive_passages_texts:
-            continue
-
-        for pos_passage in positive_passages_texts:
-            train_samples.append({'query': query_text, 'passage': pos_passage, 'label': 1, 'type': 'positive'})
-
-            # Negative samples
-            negs_to_add_total = num_neg_samples_per_positive
-            negs_added_count = 0
-
-            # 1. Add Hard Negatives (if available)
-            current_query_hard_negatives = []
-            if hard_negatives_map:
-                current_query_hard_negatives = hard_negatives_map.get(q_id, [])
-            
-            if current_query_hard_negatives:
-                # Shuffle to pick different hard negatives if more are available than needed
-                # This is useful if num_neg_samples_per_positive < len(current_query_hard_negatives)
-                random.shuffle(current_query_hard_negatives) 
-                for hn_passage in current_query_hard_negatives:
-                    if negs_added_count < negs_to_add_total:
-                        # Ensure hard negative is not accidentally a positive (should be pre-filtered but double check)
-                        if hn_passage not in positive_passages_texts: # Should be true by construction of HN
-                             train_samples.append({'query': query_text, 'passage': hn_passage, 'label': 0, 'type': 'hard_negative'})
-                             negs_added_count += 1
-                    else:
-                        break
-            
-            # 2. Fill remaining with Random Negatives
-            random_negs_needed = negs_to_add_total - negs_added_count
-            if random_negs_needed > 0:
-                attempts = 0
-                # Max attempts to find random negatives.
-                # More attempts needed if passage_corpus is small or has many overlaps with positives/hard_negs.
-                max_attempts_random = random_negs_needed * 20 
-                
-                # Create a set of already used negatives for this query to improve diversity of randoms
-                used_negatives_for_this_query = set(s['passage'] for s in train_samples if s['query'] == query_text and s['label'] == 0)
-
-                while negs_added_count < negs_to_add_total and attempts < max_attempts_random:
-                    if not passage_corpus: # Should ideally not happen with fallback
-                        logger.warning(f"Passage corpus depleted/empty during random negative sampling for q_id {q_id}.")
-                        break
-                    attempts += 1
-                    rand_neg_passage = random.choice(passage_corpus)
-                    
-                    if rand_neg_passage not in positive_passages_texts and \
-                       rand_neg_passage not in used_negatives_for_this_query:
-                        train_samples.append({'query': query_text, 'passage': rand_neg_passage, 'label': 0, 'type': 'random_negative'})
-                        negs_added_count += 1
-                        used_negatives_for_this_query.add(rand_neg_passage)
-
-    if not train_samples:
-        logger.warning("No training samples were generated. Check input data and parameters.")
-    else:
-        pos_count = sum(1 for s in train_samples if s['label'] == 1)
-        hard_neg_count = sum(1 for s in train_samples if s.get('type') == 'hard_negative')
-        rand_neg_count = sum(1 for s in train_samples if s.get('type') == 'random_negative')
-        logger.info(f"Generated {len(train_samples)} samples: "
-                    f"{pos_count} positives, {hard_neg_count} hard negatives, {rand_neg_count} random negatives.")
-    return train_samples
-
-
-class ReRankerDataset(Dataset): # No changes needed here
-    def __init__(self, samples, tokenizer_name_or_path, max_length):
-        self.samples = samples
-        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name_or_path)
-        self.max_length = max_length
-        logger.info(f"ReRankerDataset initialized with {len(samples)} samples.")
-        if not samples:
-             logger.warning("ReRankerDataset initialized with zero samples!")
-
+        if not (len(queries) == len(relevant_docs) == len(non_relevant_docs)):
+            raise ValueError("All lists (queries, relevant_docs, non_relevant_docs) must have the same length.")
 
     def __len__(self):
-        return len(self.samples)
+        return len(self.queries)
 
     def __getitem__(self, idx):
-        sample = self.samples[idx]
-        query = sample['query']
-        passage = sample['passage']
-        label = sample['label']
+        query_text = self.queries[idx]
+        rel_doc_text = self.relevant_docs[idx]
+        non_rel_doc_text = self.non_relevant_docs[idx]
 
-        encoding = self.tokenizer.encode_plus(
-            query,
-            passage,
-            add_special_tokens=True,
-            max_length=self.max_length,
-            padding='max_length',
-            truncation='only_second',
-            return_attention_mask=True,
-            return_tensors='pt'
-        )
+        # Tokenize
+        query_tokens = tokenize_text(query_text)
+        rel_doc_tokens = tokenize_text(rel_doc_text)
+        non_rel_doc_tokens = tokenize_text(non_rel_doc_text)
+
+        # Convert to sequences of IDs
+        query_seq = texts_to_sequences([query_tokens], self.vocab)[0]
+        rel_doc_seq = texts_to_sequences([rel_doc_tokens], self.vocab)[0]
+        non_rel_doc_seq = texts_to_sequences([non_rel_doc_tokens], self.vocab)[0]
+
+        # Pad sequences
+        q_padded = pad_sequence(query_seq, self.max_query_len, pad_value=self.vocab.word2idx[self.vocab.pad_token])
+        rel_d_padded = pad_sequence(rel_doc_seq, self.max_doc_len, pad_value=self.vocab.word2idx[self.vocab.pad_token])
+        non_rel_d_padded = pad_sequence(non_rel_doc_seq, self.max_doc_len, pad_value=self.vocab.word2idx[self.vocab.pad_token])
+
+        # Create masks
+        q_mask = create_mask_from_sequence(q_padded, pad_idx=self.vocab.word2idx[self.vocab.pad_token])
+        rel_d_mask = create_mask_from_sequence(rel_d_padded, pad_idx=self.vocab.word2idx[self.vocab.pad_token])
+        non_rel_d_mask = create_mask_from_sequence(non_rel_d_padded, pad_idx=self.vocab.word2idx[self.vocab.pad_token])
 
         return {
-            'input_ids': encoding['input_ids'].flatten(),
-            'attention_mask': encoding['attention_mask'].flatten(),
-            'labels': torch.tensor(label, dtype=torch.float)
+            'query_ids': torch.tensor(q_padded, dtype=torch.long),
+            'query_mask': torch.tensor(q_mask, dtype=torch.float32),
+            'rel_doc_ids': torch.tensor(rel_d_padded, dtype=torch.long),
+            'rel_doc_mask': torch.tensor(rel_d_mask, dtype=torch.float32),
+            'non_rel_doc_ids': torch.tensor(non_rel_d_padded, dtype=torch.long),
+            'non_rel_doc_mask': torch.tensor(non_rel_d_mask, dtype=torch.float32)
         }
 
-# --- Example Usage (for testing this file standalone) ---
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
+def load_bioasq_data(filepath):
+    '''Loads BioASQ JSON data.'''
+    with open(filepath, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+    return data.get('questions', [])
+
+def create_training_triples(bioasq_questions, hard_negatives_map=None, num_neg_samples=1):
+    '''
+    Creates (query, relevant_doc, non_relevant_doc) triples for training.
     
-    dummy_data_path = "dummy_bioasq_loader.json"
-    dummy_hard_negs_path = "dummy_hard_negs_loader.json"
+    Args:
+        bioasq_questions (list): List of question objects from BioASQ data.
+        hard_negatives_map (dict, optional): A map from question ID to a list of hard negative document texts.
+                                            If None, random negatives will be sampled from other relevant documents.
+        num_neg_samples (int): Number of negative samples to generate per positive pair.
 
-    dummy_bioasq_content = {
-        "questions": [
-            {"id": "q1", "body": "What is foo?", "snippets": [{"text": "Foo is a metasyntactic variable."}, {"text": "Foo Fighters is a band."}]},
-            {"id": "q2", "body": "Tell me about bar.", "snippets": [{"text": "Bar is often used with foo."}]},
-            {"id": "q3", "body": "What about baz?", "documents": ["some_doc_url"]}
-        ]
-    }
-    dummy_hard_negs_content = {
-        "q1": ["This is a hard negative for foo.", "Another tricky one for foo."],
-        "q2": ["A confusing passage about bar."]
-    }
+    Returns:
+        tuple: (queries, relevant_docs, non_relevant_docs)
+    '''
+    queries = []
+    relevant_docs_text = []
+    non_relevant_docs_text = []
 
-    with open(dummy_data_path, 'w') as f: json.dump(dummy_bioasq_content, f)
-    with open(dummy_hard_negs_path, 'w') as f: json.dump(dummy_hard_negs_content, f)
+    all_doc_texts = []
+    for q_data in bioasq_questions:
+        if q_data.get('snippets'):
+            for snippet in q_data['snippets']:
+                all_doc_texts.append(snippet['text'])
+    
+    if not all_doc_texts:
+        print("Warning: No documents found in bioasq_questions to sample random negatives from.")
+        # Fallback: use a placeholder if no documents are available at all
+        all_doc_texts = ["placeholder document text for negative sampling"] 
 
-    questions = load_bioasq_json(dummy_data_path)
-    hard_negs = load_hard_negatives(dummy_hard_negs_path)
+    for q_data in bioasq_questions:
+        query_text = q_data['body']
+        q_id = q_data.get('id')
 
-    if questions:
-        corpus = build_passage_corpus_from_bioasq(questions)
-        # Add some more variety to corpus for random sampling test
-        corpus.extend(["Random sample text 1", "Random sample text 2", "Yet another random snippet"])
-        corpus = list(set(corpus))
+        # Collect positive (relevant) documents
+        positive_snippets = [s['text'] for s in q_data.get('snippets', []) if s.get('text')]
+        if not positive_snippets:
+            continue # Skip questions with no relevant snippets
+
+        for pos_doc_text in positive_snippets:
+            # Sample non-relevant documents
+            current_neg_samples = []
+            if hard_negatives_map and q_id in hard_negatives_map:
+                # Use provided hard negatives first
+                available_hard_negs = [neg for neg in hard_negatives_map[q_id] if neg != pos_doc_text]
+                take_n = min(len(available_hard_negs), num_neg_samples)
+                current_neg_samples.extend(random.sample(available_hard_negs, take_n))
+            
+            # If more negatives are needed, sample randomly (excluding the current positive doc)
+            needed_more_negs = num_neg_samples - len(current_neg_samples)
+            if needed_more_negs > 0 and len(all_doc_texts) > 1:
+                potential_random_negs = [doc for doc in all_doc_texts if doc != pos_doc_text]
+                if potential_random_negs: # Ensure there are docs to sample from
+                    take_n_random = min(len(potential_random_negs), needed_more_negs)
+                    current_neg_samples.extend(random.sample(potential_random_negs, take_n_random))
+            
+            if not current_neg_samples and len(all_doc_texts) > 0:
+                 # Fallback if no hard negatives and random sampling failed (e.g. only one doc in corpus)
+                 # This is a weak negative, but ensures we have a triple.
+                 current_neg_samples.append(random.choice([d for d in all_doc_texts if d != pos_doc_text] or all_doc_texts))
+
+            for neg_doc_text in current_neg_samples:
+                queries.append(query_text)
+                relevant_docs_text.append(pos_doc_text)
+                non_relevant_docs_text.append(neg_doc_text)
+
+    return queries, relevant_docs_text, non_relevant_docs_text
+
+def get_dataloaders(vocab, batch_size=config.BATCH_SIZE, num_neg_samples_train=1, num_neg_samples_val=1):
+    '''
+    Prepares training and validation DataLoaders.
+    Assumes BioASQ data is split into train/val or uses the same for both if not specified.
+    For a real setup, you'd split your data.
+    '''
+    # Load raw data
+    # For simplicity, using the same data file. Split this for a real application.
+    train_questions_raw = load_bioasq_data(config.TRAIN_DATA_PATH)
+    # val_questions_raw = load_bioasq_data(config.VAL_DATA_PATH) # If you have a separate val set
+
+    # Load hard negatives if available
+    hard_negatives = None
+    try:
+        with open(config.HARD_NEGATIVES_PATH, 'r') as f:
+            hard_negatives = json.load(f) # Assuming format {q_id: [neg_doc_text_1, ...]}
+    except FileNotFoundError:
+        print(f"Hard negatives file not found at {config.HARD_NEGATIVES_PATH}. Using random negatives only.")
+
+    # Create training triples
+    # You might want to split your bioasq_questions into train and validation sets first
+    # For this example, we'll use a subset for validation if the data is large enough, or just reuse.
+    
+    # Simple split for example: 80% train, 20% val
+    random.shuffle(train_questions_raw)
+    split_idx = int(len(train_questions_raw) * 0.8)
+    train_qs_for_triples = train_questions_raw[:split_idx]
+    val_qs_for_triples = train_questions_raw[split_idx:]
+
+    if not val_qs_for_triples and train_qs_for_triples: # If data is too small for split
+        val_qs_for_triples = train_qs_for_triples 
+
+    print(f"Using {len(train_qs_for_triples)} questions for training triple generation.")
+    print(f"Using {len(val_qs_for_triples)} questions for validation triple generation.")
+
+    train_queries, train_rel_docs, train_non_rel_docs = create_training_triples(
+        train_qs_for_triples, hard_negatives, num_neg_samples=num_neg_samples_train
+    )
+    val_queries, val_rel_docs, val_non_rel_docs = create_training_triples(
+        val_qs_for_triples, hard_negatives, num_neg_samples=num_neg_samples_val
+    )
+
+    if not train_queries:
+        raise ValueError("No training triples were generated. Check data paths and content.")
+    if not val_queries:
+        print("Warning: No validation triples were generated. Validation will be skipped or use training data.")
+        # Fallback to use training data for validation if no validation triples generated
+        val_queries, val_rel_docs, val_non_rel_docs = train_queries, train_rel_docs, train_non_rel_docs
+
+    train_dataset = BioASQTripletDataset(train_queries, train_rel_docs, train_non_rel_docs, vocab)
+    val_dataset = BioASQTripletDataset(val_queries, val_rel_docs, val_non_rel_docs, vocab)
+
+    train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    val_dataloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+
+    return train_dataloader, val_dataloader
 
 
-        if corpus:
-            training_samples = create_training_samples(questions, corpus, num_neg_samples_per_positive=2, hard_negatives_map=hard_negs)
-            if training_samples:
-                logger.info(f"First sample: {training_samples[0]}")
-                for s in training_samples[:10]: logger.info(s)
+# --- For Inference --- #
+class BioASQPredictionDataset(Dataset):
+    '''Dataset for inference: takes (query, candidate_doc) pairs.'''
+    def __init__(self, queries_texts, candidate_docs_texts, vocab, 
+                 max_query_len=config.MAX_QUERY_LEN, max_doc_len=config.MAX_DOC_LEN):
+        self.queries_texts = queries_texts
+        self.candidate_docs_texts = candidate_docs_texts
+        self.vocab = vocab
+        self.max_query_len = max_query_len
+        self.max_doc_len = max_doc_len
 
-                tokenizer_name = "bert-base-uncased"
-                dataset = ReRankerDataset(training_samples, tokenizer_name, max_length=128)
-                if len(dataset) > 0: logger.info(f"Dataset sample 0: {dataset[0]}")
-                else: logger.warning("Dataset created but is empty.")
-            else:
-                logger.warning("No training samples generated in test.")
-        else:
-            logger.warning("Corpus is empty, cannot proceed with training sample generation for test.")
+        if len(queries_texts) != len(candidate_docs_texts):
+            raise ValueError("Queries and candidate documents lists must have the same length.")
+
+    def __len__(self):
+        return len(self.queries_texts)
+
+    def __getitem__(self, idx):
+        query_text = self.queries_texts[idx]
+        doc_text = self.candidate_docs_texts[idx]
+
+        query_tokens = tokenize_text(query_text)
+        doc_tokens = tokenize_text(doc_text)
+
+        query_seq = texts_to_sequences([query_tokens], self.vocab)[0]
+        doc_seq = texts_to_sequences([doc_tokens], self.vocab)[0]
+
+        q_padded = pad_sequence(query_seq, self.max_query_len, pad_value=self.vocab.word2idx[self.vocab.pad_token])
+        d_padded = pad_sequence(doc_seq, self.max_doc_len, pad_value=self.vocab.word2idx[self.vocab.pad_token])
+
+        q_mask = create_mask_from_sequence(q_padded, pad_idx=self.vocab.word2idx[self.vocab.pad_token])
+        d_mask = create_mask_from_sequence(d_padded, pad_idx=self.vocab.word2idx[self.vocab.pad_token])
+
+        return {
+            'query_ids': torch.tensor(q_padded, dtype=torch.long),
+            'query_mask': torch.tensor(q_mask, dtype=torch.float32),
+            'doc_ids': torch.tensor(d_padded, dtype=torch.long),
+            'doc_mask': torch.tensor(d_mask, dtype=torch.float32),
+            'original_query': query_text, # Keep original for grouping results
+            'original_doc': doc_text
+        }
+
+def load_first_stage_rerank_data(filepath):
+    """
+    Loads data from a first-stage ranker (e.g., BM25 output) for reranking.
+    Expected format: A list of questions, each with a 'body' (query) and 'documents' (list of URLs/IDs) 
+                     and 'snippets' (list of text snippets corresponding to documents).
+                     The reranker will typically rerank these snippets.
+    Or, a simpler list of {query_id: str, query_text: str, candidates: [{doc_id: str, doc_text: str, score: float}, ...]}
+    This function adapts to the BM25/Dense output structure you provided.
+    """
+    queries_for_rerank = []
+    candidate_docs_for_rerank = []
+    query_doc_pairs_info = [] # To store (original_query_id, original_doc_id/text) for result mapping
+
+    with open(filepath, 'r', encoding='utf-8') as f:
+        first_stage_data = json.load(f)
+    
+    questions_data = first_stage_data.get('questions', [])
+
+    for question_item in questions_data:
+        query_text = question_item.get('body')
+        query_id = question_item.get('id')
+        
+        # Assuming snippets are the candidates to rerank
+        # And that the `documents` list in BM25/Dense output corresponds to these snippets by order/URI.
+        # The `snippets` themselves contain the text.
+        snippets = question_item.get('snippets', [])
+        
+        if not query_text or not snippets:
+            continue
+
+        for snippet_data in snippets:
+            doc_text = snippet_data.get('text')
+            # Try to get a unique doc identifier, e.g. from document URL in snippet
+            doc_id = snippet_data.get('document', f"snippet_offset_{snippet_data.get('offsetInBeginSection')}_{snippet_data.get('offsetInEndSection')}") 
+            if doc_text:
+                queries_for_rerank.append(query_text)
+                candidate_docs_for_rerank.append(doc_text)
+                query_doc_pairs_info.append({
+                    'query_id': query_id,
+                    'query_text': query_text,
+                    'doc_id': doc_id, # This is the URL or a generated ID
+                    'doc_text': doc_text
+                })
+                
+    return queries_for_rerank, candidate_docs_for_rerank, query_doc_pairs_info
+
+def get_inference_dataloader(data_filepath, vocab, batch_size=config.BATCH_SIZE):
+    queries, docs, pairs_info = load_first_stage_rerank_data(data_filepath)
+    if not queries:
+        print(f"No query-document pairs loaded from {data_filepath} for inference.")
+        return None, None
+    
+    dataset = BioASQPredictionDataset(queries, docs, vocab)
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
+    return dataloader, pairs_info
+
+
+if __name__ == '__main__':
+    # --- Setup --- 
+    # 1. Build or Load Vocabulary from training texts
+    print("Building vocabulary from training data...")
+    raw_train_data = load_bioasq_data(config.TRAIN_DATA_PATH)
+    all_training_texts = []
+    for q_data in raw_train_data:
+        all_training_texts.append(tokenize_text(q_data['body']))
+        for snippet in q_data.get('snippets', []):
+            all_training_texts.append(tokenize_text(snippet['text']))
+    
+    vocab_obj = Vocabulary()
+    if all_training_texts:
+        vocab_obj.build_vocab(all_training_texts, min_freq=config.MIN_WORD_FREQ)
+        vocab_obj.save(config.VOCAB_PATH)
+        print(f"Vocabulary built and saved to {config.VOCAB_PATH}. Size: {len(vocab_obj)}")
     else:
-        logger.warning("No questions loaded, cannot proceed with test.")
+        print("No training texts found to build vocabulary. Attempting to load existing one or using empty.")
+        try:
+            vocab_obj = Vocabulary.load(config.VOCAB_PATH)
+            print(f"Vocabulary loaded from {config.VOCAB_PATH}. Size: {len(vocab_obj)}")
+        except FileNotFoundError:
+            print(f"ERROR: {config.VOCAB_PATH} not found and no data to build new vocab. Exiting.")
+            exit()
 
-    os.remove(dummy_data_path)
-    os.remove(dummy_hard_negs_path)
+    # --- Training DataLoader Example --- 
+    print("\n--- Training DataLoader Example ---")
+    train_loader, val_loader = get_dataloaders(vocab_obj, batch_size=2, num_neg_samples_train=1)
+    
+    if train_loader:
+        print(f"Train DataLoader created. Number of batches: {len(train_loader)}")
+        for i, batch in enumerate(train_loader):
+            print(f"Batch {i+1}:")
+            print("Query IDs shape:", batch['query_ids'].shape)
+            print("Rel Doc IDs shape:", batch['rel_doc_ids'].shape)
+            print("Non-Rel Doc IDs shape:", batch['non_rel_doc_ids'].shape)
+            # print("Sample Query:", batch['query_ids'][0, :10])
+            if i == 0: # Print one batch
+                break
+    else:
+        print("Failed to create training dataloader.")
+
+    if val_loader:
+        print(f"Validation DataLoader created. Number of batches: {len(val_loader)}")
+
+    # --- Inference DataLoader Example --- #
+    print("\n--- Inference DataLoader Example (using BM25 output) ---")
+    # Ensure BM25_OUTPUT_PATH in config.py points to a valid BM25 output file
+    # Create a dummy BM25 output if it doesn't exist for testing
+    dummy_bm25_output_path = config.BM25_OUTPUT_PATH
+    try:
+        with open(dummy_bm25_output_path, 'r') as f:
+            pass # Check if file exists
+    except FileNotFoundError:
+        print(f"Warning: BM25 output {dummy_bm25_output_path} not found. Creating a dummy one for example.")
+        dummy_data = {"questions": [
+            {"id": "q1_test", "body": "test query one", "snippets": [{"text": "relevant document for q1", "document": "doc1_url"}]},
+            {"id": "q2_test", "body": "test query two", "snippets": [{"text": "document for q2", "document": "doc2_url"}]}
+        ]}
+        with open(dummy_bm25_output_path, 'w') as f:
+            json.dump(dummy_data, f)
+
+    inference_loader, inference_pairs_info = get_inference_dataloader(dummy_bm25_output_path, vocab_obj, batch_size=2)
+    if inference_loader:
+        print(f"Inference DataLoader created. Number of batches: {len(inference_loader)}")
+        for i, batch in enumerate(inference_loader):
+            print(f"Inference Batch {i+1}:")
+            print("Query IDs shape:", batch['query_ids'].shape)
+            print("Doc IDs shape:", batch['doc_ids'].shape)
+            # print("Original Query:", batch['original_query'][0])
+            # print("Original Doc:", batch['original_doc'][0])
+            if i == 0: # Print one batch
+                break
+        # print("\nSample pair info from inference data:", inference_pairs_info[0] if inference_pairs_info else "N/A")
+    else:
+        print("Failed to create inference dataloader from BM25 output.")

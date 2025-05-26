@@ -1,0 +1,1 @@
+{"questions": [{"id": "q1_infer", "body": "test query for inference", "snippets": [{"text": "sample document one", "document": "doc_url_1"}, {"text": "sample document two", "document": "doc_url_2"}]}]}

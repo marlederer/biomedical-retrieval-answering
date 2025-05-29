@@ -12,9 +12,14 @@ from tqdm import tqdm
 import argparse
 from collections import defaultdict
 
+# Added BioASQPredictionDataset and DataLoader
+from data_loader import Vocabulary, get_inference_dataloader, BioASQPredictionDataset # Ensure BioASQPredictionDataset is imported
+from torch.utils.data import DataLoader # Ensure DataLoader is imported
+# Import from BM25 package
+from api_client import call_bioasq_api_search
+
 import config
 from knrm import KNRM
-from data_loader import Vocabulary, get_inference_dataloader
 from metrics import calculate_mrr # For potential evaluation if ground truth is available
 
 def ensure_dir(directory):
@@ -168,76 +173,230 @@ def rerank_documents(
         except Exception as e:
             print(f"Error during MRR calculation: {e}")
 
+def rerank_for_single_query(
+    query_string: str,
+    model, # KNRM model instance
+    vocab, # Vocabulary instance
+    bioasq_api_url: str,
+    num_initial_candidates: int,
+    top_k_output: int
+):
+    print(f'Fetching initial candidates for query: "{query_string}" from BioASQ API...')
+    api_articles = call_bioasq_api_search(
+        query_keywords=query_string,
+        num_articles_to_fetch=num_initial_candidates,
+        api_endpoint_url=bioasq_api_url
+    )
+
+    if not api_articles:
+        print("No documents retrieved from BioASQ API for the query.")
+        return []
+
+    print(f"Retrieved {len(api_articles)} initial candidates.")
+
+    queries_for_rerank = []
+    candidate_docs_for_rerank = []
+    candidate_details_for_output = []
+    # Use a simple query_id for this single run, or generate one if needed for specific formats
+    query_id_for_this_run = f"single_query_{hash(query_string)}_run"
+
+    for article in api_articles:
+        abstract = article.get('abstract', '')
+        # Ensure abstract is not empty or just whitespace, as it's used for reranking
+        if not abstract or not abstract.strip(): 
+            # print(f"Skipping article {article.get('id')} due to empty abstract.") # Optional: for debugging
+            continue
+        queries_for_rerank.append(query_string)
+        candidate_docs_for_rerank.append(abstract)
+        candidate_details_for_output.append({
+            'query_id': query_id_for_this_run, # Use the consistent query_id
+            'query_text': query_string,
+            'doc_id': article.get('id') or article.get('url', 'N/A'), # Get PMID or URL
+            'title': article.get('title', 'N/A'),
+            'doc_text': abstract # Store the abstract that will be reranked
+        })
+    
+    if not candidate_docs_for_rerank: # Check if any valid docs are left after filtering
+        print("No valid candidate documents with abstracts to rerank after filtering.")
+        return []
+
+    print(f"Processing {len(candidate_docs_for_rerank)} candidates with abstracts for reranking...")
+
+    # Create Dataset and DataLoader for the retrieved candidates
+    prediction_dataset = BioASQPredictionDataset(
+        queries_for_rerank, 
+        candidate_docs_for_rerank, 
+        vocab,
+        max_query_len=config.MAX_QUERY_LEN, # from config
+        max_doc_len=config.MAX_DOC_LEN    # from config
+    )
+    prediction_dataloader = DataLoader(
+        prediction_dataset, 
+        batch_size=config.BATCH_SIZE, # from config
+        shuffle=False # No need to shuffle for inference
+    )
+
+    model.eval() # Ensure model is in evaluation mode
+    all_reranked_results = []
+
+    with torch.no_grad(): # Disable gradient calculations for inference
+        progress_bar = tqdm(prediction_dataloader, desc=f"Reranking for query: {query_string[:30]}...")
+        batch_start_idx = 0
+        for batch in progress_bar:
+            query_ids_b = batch['query_ids'].to(config.DEVICE)
+            query_mask_b = batch['query_mask'].to(config.DEVICE)
+            doc_ids_b = batch['doc_ids'].to(config.DEVICE)
+            doc_mask_b = batch['doc_mask'].to(config.DEVICE)
+
+            scores_b = model(query_ids_b, doc_ids_b, query_mask_b, doc_mask_b)
+            scores_b = scores_b.squeeze(-1).cpu().tolist() # Get scores as a list
+
+            # Map scores back to original candidate details
+            for i, score in enumerate(scores_b):
+                detail_idx = batch_start_idx + i
+                if detail_idx < len(candidate_details_for_output):
+                    original_candidate_info = candidate_details_for_output[detail_idx]
+                    all_reranked_results.append({
+                        **original_candidate_info, # Spread the original info (query_id, doc_id, text, etc.)
+                        'rerank_score': score
+                    })
+            batch_start_idx += len(scores_b) # Correctly increment for next batch
+            
+    # Sort all collected results by rerank_score in descending order
+    sorted_results = sorted(all_reranked_results, key=lambda x: x['rerank_score'], reverse=True)
+    
+    # Return only the top_k_output documents
+    return sorted_results[:top_k_output]
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Rerank documents using a trained KNRM model.")
     parser.add_argument("--model_path", type=str, default=config.SAVE_MODEL_PATH,
                         help="Path to the trained KNRM model file (.pth)")
     parser.add_argument("--vocab_path", type=str, default=config.VOCAB_PATH,
                         help="Path to the vocabulary file (.json)")
-    parser.add_argument("--input_file", type=str, required=True,
-                        help="Path to the input file from a first-stage retriever (e.g., BM25 output JSON)")
-    parser.add_argument("--output_file", type=str, default="reranked_output/knrm_reranked_bioasq.json",
-                        help="Path to save the reranked output JSON")
-    parser.add_argument("--ground_truth_file", type=str, default=config.TRAIN_DATA_PATH, # Example: use train data for GT structure
-                        help="Optional: Path to the ground truth BioASQ JSON file for MRR calculation.")
+    
+    # Group for mutually exclusive --input_file or --query
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("--input_file", type=str,
+                        help="Path to the input file from a first-stage retriever (e.g., BM25 output JSON) for batch reranking.")
+    group.add_argument("--query", type=str,
+                        help="A single query string to process for end-to-end reranking via BioASQ API.")
+
+    parser.add_argument("--output_file", type=str, 
+                        help="Path to save the output JSON. If in --query mode and not provided, results are printed to console. If in --input_file mode and not provided, a default name is used.")
+    parser.add_argument("--ground_truth_file", type=str, default=config.TRAIN_DATA_PATH,
+                        help="Optional: Path to the ground truth BioASQ JSON file for MRR calculation (only used with --input_file mode).")
     
     args = parser.parse_args()
 
-    # Create dummy files for a quick test if they don't exist
-    ensure_dir("data")
-    ensure_dir("models")
-    ensure_dir(os.path.dirname(args.output_file))
+    # Ensure essential directories exist
+    ensure_dir(os.path.dirname(config.VOCAB_PATH)) # For vocab if it needs to be created by dummy logic
+    ensure_dir(os.path.dirname(config.SAVE_MODEL_PATH)) # For model if it needs to be created by dummy logic
+    if args.output_file:
+        ensure_dir(os.path.dirname(args.output_file))
+    else: # Ensure default output directory for batch mode exists if no output_file is specified
+        if args.input_file:
+            ensure_dir("reranked_output")
 
+    # --- Load Vocabulary and Model (common for both modes) ---
     if not os.path.exists(args.vocab_path):
-        print(f"Warning: Dummy vocabulary created at {args.vocab_path} for inference script execution.")
+        print(f"Warning: Vocabulary file {args.vocab_path} not found. Creating a dummy vocab for script execution.")
         dummy_vocab_data = {"word2idx": {"<pad>": 0, "<unk>": 1, "test": 2, "document":3 }, "idx2word": {"0": "<pad>", "1": "<unk>", "2": "test", "3": "document"}}
-        with open(args.vocab_path, 'w') as f:
+        with open(args.vocab_path, 'w') as f: # This will create vocab in data/ if config.VOCAB_PATH is data/vocab.json
             json.dump(dummy_vocab_data, f)
+    
+    print(f"Loading vocabulary from {args.vocab_path}...")
+    try:
+        vocab = Vocabulary.load(args.vocab_path)
+    except FileNotFoundError:
+        print(f"ERROR: Vocabulary file not found at {args.vocab_path} even after dummy check. Exiting.")
+        exit(1)
+    except Exception as e:
+        print(f"Error loading vocabulary: {e}. Exiting.")
+        exit(1)
+    print(f"Vocabulary loaded. Size: {len(vocab)}")
 
     if not os.path.exists(args.model_path):
-        print(f"Warning: Model path {args.model_path} does not exist. Inference will likely fail unless a model is placed there.")
-        # Cannot create a dummy model easily, user must train one.
+        print(f"ERROR: Model path {args.model_path} does not exist. Please train a model first. Exiting.")
+        exit(1)
 
-    # Check if input file exists, if not, try to use a default from config or make a dummy one
-    input_file_to_use = args.input_file
-    if not os.path.exists(input_file_to_use):
-        print(f"Warning: Specified input file {input_file_to_use} not found.")
-        # Try to use one of the default config paths if they exist
-        if os.path.exists(config.BM25_OUTPUT_PATH):
-            print(f"Using BM25 output from config: {config.BM25_OUTPUT_PATH}")
-            input_file_to_use = config.BM25_OUTPUT_PATH
-        elif os.path.exists(config.DENSE_OUTPUT_PATH):
-            print(f"Using Dense retriever output from config: {config.DENSE_OUTPUT_PATH}")
-            input_file_to_use = config.DENSE_OUTPUT_PATH
+    print(f"Loading KNRM model from {args.model_path}...")
+    model = KNRM(
+        vocab_size=len(vocab),
+        embedding_dim=config.EMBEDDING_DIM,
+        n_kernels=config.N_KERNELS
+    ).to(config.DEVICE)
+    try:
+        model.load_state_dict(torch.load(args.model_path, map_location=config.DEVICE))
+    except Exception as e:
+        print(f"Error loading model state_dict: {e}. Exiting.")
+        exit(1)
+    model.eval() # Set model to evaluation mode
+    print("Model loaded.")
+
+    # --- Mode selection based on arguments ---
+    if args.query:
+        # Single query mode execution
+        print(f"Executing in single query mode for: \"{args.query}\"")
+        top_reranked_docs = rerank_for_single_query(
+            query_string=args.query,
+            model=model,
+            vocab=vocab,
+            bioasq_api_url=config.BIOASQ_API_ENDPOINT_URL,
+            num_initial_candidates=config.API_NUM_INITIAL_CANDIDATES,
+            top_k_output=config.RERANK_TOP_K_OUTPUT
+        )
+
+        if top_reranked_docs:
+            print(f"\nTop {len(top_reranked_docs)} reranked documents for query: \"{args.query}\"")
+            # Prepare for printing or saving
+            output_data_single_query = {
+                "query": args.query,
+                "reranked_documents": top_reranked_docs
+            }
+            formatted_output_json = json.dumps(output_data_single_query, indent=4)
+            print(formatted_output_json)
+            
+            if args.output_file:
+                with open(args.output_file, 'w', encoding='utf-8') as f:
+                    f.write(formatted_output_json)
+                print(f"Single query results saved to {args.output_file}")
         else:
-            print(f"Warning: Dummy input retrieval data created at 'dummy_retrieval_input.json' for inference script execution.")
+            print(f"No results to display or save for query: \"{args.query}\"")
+
+    elif args.input_file:
+        # Batch reranking from file mode (existing functionality)
+        print(f"Executing in batch mode with input file: {args.input_file}")
+        input_file_to_use = args.input_file
+        if not os.path.exists(input_file_to_use):
+            # This dummy creation logic might be too aggressive if user just mistyped.
+            # For now, it ensures script can run for testing if file is missing.
+            print(f"Warning: Specified input file {input_file_to_use} not found.")
+            print(f"Creating dummy input retrieval data at 'dummy_retrieval_input_batch.json' for script execution.")
             dummy_retrieval_data = {"questions": [
-                {"id": "q1_infer", "body": "test query for inference", 
-                 "snippets": [{"text": "sample document one", "document": "doc_url_1"}, {"text": "sample document two", "document": "doc_url_2"}]}
+                {"id": "q1_infer_batch_dummy", "body": "dummy query for batch", 
+                 "snippets": [{"text": "dummy doc 1 batch", "document": "dummy_doc_url_1"}, {"text": "dummy doc 2 batch", "document": "dummy_doc_url_2"}]}
             ]}
-            input_file_to_use = "dummy_retrieval_input.json"
+            input_file_to_use = "dummy_retrieval_input_batch.json" 
             with open(input_file_to_use, 'w') as f:
                 json.dump(dummy_retrieval_data, f)
-    
-    # Ensure ground truth file exists if specified, or create a dummy one for testing structure
-    gt_file_to_use = args.ground_truth_file
-    if gt_file_to_use and not os.path.exists(gt_file_to_use):
-        if gt_file_to_use == config.TRAIN_DATA_PATH and os.path.exists(config.TRAIN_DATA_PATH):
-            pass # It will use the one from config
-        else:
-            print(f"Warning: Dummy ground truth data created at {gt_file_to_use} for MRR calculation structure test.")
-            dummy_gt_data = {"questions": [
-                {"id": "q1_infer", "body": "test query for inference", "documents": ["doc_url_1"], 
-                 "snippets": [{"text": "sample document one", "document": "doc_url_1"}] # Assuming doc_url_1 is relevant
-                }
-            ]}
-            with open(gt_file_to_use, 'w') as f:
-                json.dump(dummy_gt_data, f)
+        
+        # Determine output file path for batch mode
+        output_file_for_batch = args.output_file
+        if not output_file_for_batch: # If no output file specified for batch mode, use a default
+            output_file_for_batch = os.path.join("reranked_output", "knrm_reranked_bioasq_batch_default.json")
+        ensure_dir(os.path.dirname(output_file_for_batch)) # Ensure directory for output file exists
 
-    rerank_documents(
-        model_path=args.model_path,
-        vocab_path=args.vocab_path,
-        input_retrieval_path=input_file_to_use,
-        output_reranked_path=args.output_file,
-        ground_truth_path=gt_file_to_use
-    )
+        gt_file_to_use = args.ground_truth_file
+        # Only attempt to use ground truth if the file actually exists
+        if gt_file_to_use and not os.path.exists(gt_file_to_use):
+            print(f"Warning: Ground truth file {gt_file_to_use} not found. MRR calculation will be skipped.")
+            gt_file_to_use = None # Set to None so rerank_documents skips MRR
+
+        rerank_documents(
+            model_path=args.model_path,
+            vocab_path=args.vocab_path,
+            input_retrieval_path=input_file_to_use,
+            output_reranked_path=output_file_for_batch,
+            ground_truth_path=gt_file_to_use 
+        )

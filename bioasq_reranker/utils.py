@@ -9,12 +9,6 @@ from nltk.tokenize import word_tokenize
 
 import config
 
-# Ensure NLTK's punkt tokenizer is downloaded if using NLTK
-# try:
-#     nltk.data.find('tokenizers/punkt')
-# except nltk.downloader.DownloadError:
-#     nltk.download('punkt')
-
 class Vocabulary:
     def __init__(self, pad_token=config.PAD_TOKEN, unk_token=config.UNK_TOKEN):
         self.pad_token = pad_token
@@ -100,7 +94,7 @@ def create_mask_from_sequence(sequence, pad_idx=0):
 
 
 if __name__ == '__main__':
-    # Example Usage
+    # Test scenario for the utility functions )
     sample_texts = [
         "This is the first document.",
         "This document is the second document.",

@@ -17,6 +17,7 @@ This project implements and evaluates different retrieval and re-ranking methods
 3.  Install the required dependencies:
     ```bash
     pip install -r requirements.txt
+    # Optional if cuda device is available: pip3 install torch --index-url https://download.pytorch.org/whl/cu126
     ```
 
 ## How to Run

@@ -29,7 +29,7 @@ To run the BM25 retrieval model, navigate to the `BM25` directory and execute th
 cd BM25
 python main.py
 ```
-Make sure the necessary data files are present in the `data/` directory as specified in the configuration.
+
 
 ### Dense Retrieval
 
@@ -39,15 +39,30 @@ To run the Dense Retrieval model, navigate to the `Dense` directory and execute 
 cd Dense
 python dense_pipeline.py
 ```
-Ensure that the pre-trained models and data are correctly set up as per the instructions in the `Dense/README.md` if available, or check the configuration files.
 
 ### Re-ranker
 
-To run the KNRM re-ranker, navigate to the `bioasq_reranker` directory and execute the `inference.py` script. You will typically need to provide the results from a retrieval model (like BM25 or Dense Retrieval) as input.
-
+The model for the re-ranker should be present in the `bioasq_reranker/models/` directory. If you need to train the re-ranker, use the `train.py` script in the same directory. You can change the training dataset in `bioasq_reranker/config.py`
 ```bash
 cd bioasq_reranker
-python inference.py --input_file <path_to_retrieval_results.json> --output_file <path_to_reranked_results.json>
+python train.py
 ```
-Replace `<path_to_retrieval_results.json>` with the actual path to the JSON file containing the retrieval results and `<path_to_reranked_results.json>` with the desired output file name.
-The model for the re-ranker should be present in the `bioasq_reranker/models/` directory. If you need to train the re-ranker, use the `train.py` script in the same directory.
+
+To run the KNRM re-ranker, execute the `inference.py` script. You will need to provide the results from a retrieval model (like BM25 or Dense Retrieval) as input.
+
+```bash
+python bioasq_reranker/inference.py --input_file <path_to_retrieval_results.json> --model_path <path_to_model> --output_file <path_to_reranked_results.json>  --vocab_path <path_to_vocab.json> --ground_truth_file <path_to_ground_truth.json>
+```
+Replace the placeholders with the actual file paths for the following:
+
+- The JSON file that contains the retrieval results
+- The model file
+- The desired name and path for the output file
+- The vocabulary file path
+- The ground truth file
+
+One setting which should work out of the box is the following command.
+
+```bash
+python bioasq_reranker/inference.py --input_file bioasq_reranker/data/bm25.json --model_path bioasq_reranker/models/knrm_model.pth --output_file bioasq_reranker/reranked_bm25.json --vocab_path bioasq_reranker/data/vocab.json --ground_truth_file bioasq_reranker/data/training13b.json
+```

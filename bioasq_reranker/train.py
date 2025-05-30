@@ -31,9 +31,6 @@ def train_knrm():
         print(f"Vocabulary loaded from {config.VOCAB_PATH}. Size: {len(vocab)}")
     except FileNotFoundError:
         print(f"Vocabulary file not found at {config.VOCAB_PATH}. Building from training data...")
-        # This part is simplified; data_loader.py's main block is more robust for initial vocab creation.
-        # For this script, we primarily expect vocab to exist or be created by data_loader.py first.
-        # As a fallback, try to build it here if data_loader.py wasn't run to create it.
         try:
             from data_loader import load_bioasq_data # Specific import
             raw_train_data = load_bioasq_data(config.TRAIN_DATA_PATH)
@@ -88,11 +85,6 @@ def train_knrm():
 
     # --- 4. Optimizer and Loss Function ---
     optimizer = optim.Adam(model.parameters(), lr=config.LEARNING_RATE)
-    # Plain Margin Loss: loss = max(0, S_nonrel - S_rel + margin)
-    # PyTorch's MarginRankingLoss is: max(0, -y * (x1 - x2) + margin)
-    # We want S_rel to be higher than S_nonrel.
-    # So, x1 = S_rel, x2 = S_nonrel, y = 1 (target is 1, meaning x1 should be greater than x2)
-    # loss = max(0, -1 * (S_rel - S_nonrel) + margin) = max(0, S_nonrel - S_rel + margin)
     criterion = nn.MarginRankingLoss(margin=config.MARGIN_LOSS)
 
     # --- 5. Training Loop ---
@@ -170,7 +162,7 @@ def train_knrm():
 
 if __name__ == '__main__':
     # Create dummy data files if they don't exist for the script to run without manual setup for a quick test.
-    # This is for convenience. In a real scenario, data should be properly placed.
+    # This is just for testing
     ensure_dir("data")
     if not os.path.exists(config.TRAIN_DATA_PATH):
         print(f"Warning: Dummy training data created at {config.TRAIN_DATA_PATH} for training script execution.")

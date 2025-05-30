@@ -162,9 +162,7 @@ def calculate_metrics(ground_truth_data: dict[str, set[str]],
     accuracy = accurate_questions_count / num_evaluated_questions
     avg_precision_macro = total_precision_q / num_evaluated_questions
     avg_recall_macro = total_recall_q / num_evaluated_questions
-    avg_f1_macro = total_f1_q / num_evaluated_questions # This is macro F1 by averaging F1_q
-    # An alternative F1 can be calculated from avg_precision_macro and avg_recall_macro
-    # f1_from_avg_pr = (2 * avg_precision_macro * avg_recall_macro) / (avg_precision_macro + avg_recall_macro) if (avg_precision_macro + avg_recall_macro) > 0 else 0.0
+    avg_f1_macro = total_f1_q / num_evaluated_questions
     
     mrr_at_k = total_reciprocal_rank_q / num_evaluated_questions
 
@@ -321,7 +319,7 @@ def main():
     script_dir = os.path.dirname(os.path.abspath(__file__))
     
     # Path to training13b.json (ground truth)
-    ground_truth_filepath = os.path.abspath(os.path.join(script_dir, '..', 'training13b.json'))
+    ground_truth_filepath = os.path.abspath(os.path.join(script_dir, '..', 'data/training13b.json'))
     # Path to bioasq_output_reranker.json (predictions)
     predicted_filepath = os.path.join(script_dir, '../bioasq_reranker/data/dense.json')
 

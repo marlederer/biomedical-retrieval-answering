@@ -1,6 +1,7 @@
-torch
+rank_bm25
 nltk
+requests
+torch
 numpy
 tqdm
-requests
 beautifulsoup4

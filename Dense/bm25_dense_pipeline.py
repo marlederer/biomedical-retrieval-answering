@@ -1,12 +1,11 @@
 import os
-import sys # Import sys for exit
-import json # Import json for loading config
+import sys 
+import json
 # Add BM25 folder to the Python path
 current_dir = os.path.dirname(os.path.abspath(__file__))
 bm25_dir = os.path.join(current_dir, '..', 'BM25')
 sys.path.append(bm25_dir)
 
-# Import functions from our refactored modules using relative imports
 from keyword_extractor import extract_keyword_combinations
 from api_client import search_pubmed, fetch_pubmed_details
 from ranker import rank_articles_bm25
@@ -14,10 +13,8 @@ from evaluation import load_ground_truth, calculate_precision_recall_f1, extract
 from dense_retrieval import encode_contexts, encode_query, rank_with_dense_retrieval, select_top_k_snippets_from_articles
 
 # --- Configuration Loading ---
-script_dir = os.path.dirname(__file__) # Get the directory where the script is located
+script_dir = os.path.dirname(__file__)
 config_filepath = os.path.join(script_dir, 'config.json')
-# The ground_truth_filepath is now the input file for questions
-# input_questions_filepath = os.path.join(script_dir, '..', 'training13b.json') # Remove this line
 
 try:
     with open(config_filepath, 'r') as f:
@@ -30,19 +27,19 @@ except json.JSONDecodeError:
     sys.exit(1)
 
 # --- Use loaded configuration ---
-BIOASQ_API_ENDPOINT = config.get("api_endpoint", "http://bioasq.org:8000/pubmed") # Provide default
+BIOASQ_API_ENDPOINT = config.get("api_endpoint", "http://bioasq.org:8000/pubmed")
 num_candidates_per_combination = config.get("num_candidates_per_combination", 100)
-num_initial_bm25 = config.get("num_initial_bm25", 1000)  # NEW: how many BM25 results to keep
+num_initial_bm25 = config.get("num_initial_bm25", 1000)
 print("num_initial_bm25: " + str(num_initial_bm25))
 num_final_results = config.get("num_final_results", 10)
 debug_mode = config.get("debug_mode", False)
 debug_limit = config.get("debug_limit", 5)
-output_mode = config.get("output_mode", "evaluation") # New setting: "evaluation" or "json"
-input_questions_filepath_config = config.get("input_questions_filepath", "../training13b.json") # Default if not in config
+output_mode = config.get("output_mode", "evaluation")
+input_questions_filepath_config = config.get("input_questions_filepath", "../training13b.json")
 predictions_filepath_config = config.get("predictions_filepath", "bioasq_output_first100test.json") 
-# Resolve the input questions filepath relative to the script directory
 input_questions_filepath = os.path.abspath(os.path.join(script_dir, input_questions_filepath_config))
 predictions_questions_filepath = os.path.abspath(os.path.join(script_dir, predictions_filepath_config))
+
 # --- Main Orchestration ---
 
 if __name__ == "__main__":

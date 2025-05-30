@@ -33,7 +33,6 @@ def encode_contexts(contexts, batch_size=32):
         else:
             try:
                 coerced = str(c).strip()
-                #print(f"[DEBUG] Coerced non-str context at index {idx}: {c!r} -> {coerced!r}")
                 safe_contexts.append(coerced)
             except Exception as e:
                 print(f"[DEBUG] Failed to convert context at index {idx}: {c!r}. Error: {e}. Replacing with empty string.")

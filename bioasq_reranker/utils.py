@@ -9,7 +9,6 @@ from nltk.tokenize import word_tokenize
 
 import config
 
-# Ensure NLTK's punkt tokenizer is downloaded if using NLTK
 try:
     nltk.data.find('tokenizers/punkt')
 except nltk.downloader.DownloadError:
@@ -32,7 +31,7 @@ class Vocabulary:
 
     def build_vocab(self, texts, min_freq=config.MIN_WORD_FREQ):
         for text in texts:
-            for word in text: # Assuming texts are already tokenized
+            for word in text:
                 self.add_word(word)
         
         # Prune vocabulary based on min_freq
@@ -43,7 +42,7 @@ class Vocabulary:
         current_idx = 2
         for word, count in self.word_counts.items():
             if count >= min_freq:
-                if word not in pruned_word2idx: # Avoid re-adding PAD/UNK if they met freq
+                if word not in pruned_word2idx:
                     pruned_word2idx[word] = current_idx
                     pruned_idx2word[current_idx] = word
                     current_idx += 1
@@ -72,12 +71,11 @@ class Vocabulary:
 
 def tokenize_text(text, tokenizer_type=config.TOKENIZER_TYPE):
     '''Tokenizes a single text string.'''
-    text = text.lower() # Convert to lowercase
+    text = text.lower()
     if tokenizer_type == "nltk":
         return word_tokenize(text)
     elif tokenizer_type == "basic_whitespace":
         return text.split()
-    # Add other tokenizers like SpaCy if needed
     else:
         raise ValueError(f"Unsupported tokenizer type: {tokenizer_type}")
 
@@ -100,14 +98,6 @@ def create_mask_from_sequence(sequence, pad_idx=0):
 
 
 if __name__ == '__main__':
-    # Example Usage
-    sample_texts = [
-        "This is the first document.",
-        "This document is the second document.",
-        "And this is the third one.",
-        "Is this the first document?"
-    ]
-
     # Tokenize
     tokenized_texts = [tokenize_text(text) for text in sample_texts]
     print("Tokenized Texts:", tokenized_texts)

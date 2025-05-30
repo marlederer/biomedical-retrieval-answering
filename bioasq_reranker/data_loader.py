@@ -145,9 +145,7 @@ def get_dataloaders(vocab, batch_size=config.BATCH_SIZE, num_neg_samples_train=1
     For a real setup, you'd split your data.
     '''
     # Load raw data
-    # For simplicity, using the same data file. Split this for a real application.
     train_questions_raw = load_bioasq_data(config.TRAIN_DATA_PATH)
-    # val_questions_raw = load_bioasq_data(config.VAL_DATA_PATH) # If you have a separate val set
 
     # Load hard negatives if available
     hard_negatives = None

@@ -11,7 +11,7 @@ import json
 import config
 from knrm import KNRM
 from data_loader import get_dataloaders, Vocabulary
-from utils import tokenize_text # For vocab building if not present
+from utils import tokenize_text
 
 
 def ensure_dir(directory):
@@ -21,8 +21,8 @@ def ensure_dir(directory):
 def train_knrm():
     # Ensure model save directory exists
     ensure_dir(os.path.dirname(config.SAVE_MODEL_PATH))
-    ensure_dir(os.path.dirname(config.VOCAB_PATH)) # For vocab
-    ensure_dir(os.path.dirname(config.TRAIN_DATA_PATH)) # For data
+    ensure_dir(os.path.dirname(config.VOCAB_PATH))
+    ensure_dir(os.path.dirname(config.TRAIN_DATA_PATH))
 
     # --- 1. Load or Build Vocabulary ---
     print("Loading/Building vocabulary...")
@@ -32,7 +32,7 @@ def train_knrm():
     except FileNotFoundError:
         print(f"Vocabulary file not found at {config.VOCAB_PATH}. Building from training data...")
         try:
-            from data_loader import load_bioasq_data # Specific import
+            from data_loader import load_bioasq_data
             raw_train_data = load_bioasq_data(config.TRAIN_DATA_PATH)
             if not raw_train_data:
                 print(f"ERROR: Training data not found at {config.TRAIN_DATA_PATH} or is empty. Cannot build vocabulary.")
@@ -154,38 +154,12 @@ def train_knrm():
                 torch.save(model.state_dict(), config.SAVE_MODEL_PATH)
                 print(f"Model improved and saved to {config.SAVE_MODEL_PATH}")
         else:
-            # If no validation loader, save model after each epoch or based on training loss (less ideal)
             torch.save(model.state_dict(), config.SAVE_MODEL_PATH)
             print(f"Model saved to {config.SAVE_MODEL_PATH} (no validation performed)")
 
     print("Training complete.")
 
 if __name__ == '__main__':
-    # Create dummy data files if they don't exist for the script to run without manual setup for a quick test.
-    # This is just for testing
     ensure_dir("data")
-    if not os.path.exists(config.TRAIN_DATA_PATH):
-        print(f"Warning: Dummy training data created at {config.TRAIN_DATA_PATH} for training script execution.")
-        dummy_train_data = {"questions": [
-            {
-                "id": "dummy_q1", 
-                "body": "what is dummy data", 
-                "snippets": [
-                    {"text": "dummy data is placeholder information"},
-                    {"text": "it is used for testing purposes"}
-                ]
-            },
-            {
-                "id": "dummy_q2", 
-                "body": "example of a question", 
-                "snippets": [
-                    {"text": "this is an example answer snippet"},
-                    {"text": "another relevant piece of text for q2"}
-                ]
-            }
-        ]}
-        with open(config.TRAIN_DATA_PATH, 'w') as f:
-            json.dump(dummy_train_data, f)
-    
     train_knrm()
 

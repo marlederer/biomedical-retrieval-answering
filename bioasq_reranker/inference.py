@@ -325,32 +325,13 @@ if __name__ == '__main__':
         elif os.path.exists(config.DENSE_OUTPUT_PATH):
             print(f"Using Dense retriever output from config: {config.DENSE_OUTPUT_PATH}")
             input_file_to_use = config.DENSE_OUTPUT_PATH
-        else:
-            print(f"Warning: Dummy input retrieval data created at 'dummy_retrieval_input.json' for inference script execution.")
-            # Ensure dummy data has 'documents' field for URLs
-            dummy_retrieval_data = {"questions": [
-                {"id": "q1_infer", "body": "test query for inference", 
-                 "documents": ["http://example.com/doc1", "http://example.com/doc2"], # Added documents field
-                 "snippets": [{"text": "sample document one", "document": "http://example.com/doc1"}, 
-                              {"text": "sample document two", "document": "http://example.com/doc2"}]}
-            ]}
-            input_file_to_use = "dummy_retrieval_input.json"
-            with open(input_file_to_use, 'w') as f:
-                json.dump(dummy_retrieval_data, f)
+
     
     gt_file_to_use = args.ground_truth_file
     if gt_file_to_use and not os.path.exists(gt_file_to_use):
         if gt_file_to_use == config.TRAIN_DATA_PATH and os.path.exists(config.TRAIN_DATA_PATH):
             pass 
-        else:
-            print(f"Warning: Dummy ground truth data created at {gt_file_to_use} for MRR calculation structure test.")
-            dummy_gt_data = {"questions": [
-                {"id": "q1_infer", "body": "test query for inference", "documents": ["doc_url_1"], 
-                 "snippets": [{"text": "sample document one", "document": "doc_url_1"}] 
-                }
-            ]}
-            with open(gt_file_to_use, 'w') as f:
-                json.dump(dummy_gt_data, f)
+
 
     rerank_documents(
         model_path=args.model_path,

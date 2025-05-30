@@ -96,9 +96,9 @@ def call_bioasq_api_search(query_keywords, num_articles_to_fetch, api_endpoint_u
 
         headers = {'Content-Type': 'application/x-www-form-urlencoded'}
         #Print request for debugging
-        # print(f"Requesting session endpoint: {session_endpoint_url}") # Keep commented unless debugging
+        # print(f"Requesting session endpoint: {session_endpoint_url}")
         daten = {"json": json.dumps(payload)}
-        # print(daten) # Keep commented unless debugging
+        # print(daten)
         response = requests.post(session_endpoint_url, headers=headers, data={"json": json.dumps(payload)}, timeout=60)
 
         if response.status_code != 200:

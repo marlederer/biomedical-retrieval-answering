@@ -12,7 +12,7 @@ This project implements and evaluates different retrieval and re-ranking methods
 2.  Create a virtual environment (optional but recommended):
     ```bash
     python -m venv .venv
-    source venv/bin/activate  # On Windows use `.venv\Scripts\activate.bat`
+    source .venv/bin/activate  # On Windows use `.venv\Scripts\activate.bat`
     ```
 3.  Install the required dependencies:
     ```bash

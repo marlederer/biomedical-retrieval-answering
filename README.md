@@ -36,8 +36,9 @@ python main.py
 To run the Dense Retrieval model, navigate to the `Dense` directory and execute the `dense_pipeline.py` script:
 
 ```bash
+python -m spacy download en_core_web_sm
 cd Dense
-python dense_pipeline.py
+python bm25_dense_pipeline.py
 ```
 
 ### Re-ranker

@@ -1,7 +1,3 @@
-'''
-Compares ground truth document relevance with predicted document relevance from BioASQ-formatted JSON files.
-Calculates Accuracy, Precision, Recall, F1-score (macro-averaged), and MRR@k.
-'''
 import json
 import os
 
@@ -55,7 +51,7 @@ def load_questions_data(filepath: str) -> dict[str, dict[str, list[str]]]:
                         s_text = str(s_item['text']).strip()
                         if s_text: # Only add non-empty snippets
                             processed_snippets.append(s_text)
-                    elif isinstance(s_item, str): # Fallback for simple string snippets (e.g. from ground truth if different)
+                    elif isinstance(s_item, str):
                         s_text = s_item.strip()
                         if s_text:
                             processed_snippets.append(s_text)
@@ -86,7 +82,7 @@ def calculate_metrics(ground_truth_data: dict[str, set[str]],
     total_f1_q = 0.0
     total_reciprocal_rank_q = 0.0
     accurate_questions_count = 0
-    num_evaluated_questions = 0 # Will count common questions
+    num_evaluated_questions = 0 
 
     # Determine common question IDs for evaluation
     gt_ids = set(ground_truth_data.keys())
@@ -104,11 +100,11 @@ def calculate_metrics(ground_truth_data: dict[str, set[str]],
             "evaluated_questions": 0
         }
 
-    for q_id in common_q_ids: # Iterate over common question IDs
+    for q_id in common_q_ids:
         num_evaluated_questions += 1
         
-        true_pmids_set = ground_truth_data[q_id] # q_id is in ground_truth_data
-        predicted_pmids_list = predicted_data[q_id] # q_id is in predicted_data
+        true_pmids_set = ground_truth_data[q_id]
+        predicted_pmids_list = predicted_data[q_id]
         
         # Consider only the top 10 predictions for comparison
         predicted_pmids_list = predicted_pmids_list[:10]
@@ -126,7 +122,7 @@ def calculate_metrics(ground_truth_data: dict[str, set[str]],
             # If ground truth is empty: recall is 1 if predictions are also empty, else 0.
             recall_q = 1.0 if not retrieved_pmids_set else 0.0
         else:
-            recall_q = tp / len(true_pmids_set) # len(true_pmids_set) > 0 here
+            recall_q = tp / len(true_pmids_set)
         
         f1_q = (2 * precision_q * recall_q) / (precision_q + recall_q) if (precision_q + recall_q) > 0 else 0.0
         
@@ -155,7 +151,6 @@ def calculate_metrics(ground_truth_data: dict[str, set[str]],
         total_reciprocal_rank_q += reciprocal_rank_q
 
     if num_evaluated_questions == 0:
-        # This case should ideally be caught by the initial check of ground_truth_data
         return {"accuracy": 0.0, "precision_macro": 0.0, "recall_macro": 0.0, 
                 "f1_score_macro": 0.0, f"mrr@{k_mrr}": 0.0, "evaluated_questions": 0}
 
@@ -227,8 +222,6 @@ def calculate_snippet_metrics_jaccard(
         num_evaluated_questions += 1
 
         true_snippet_texts = ground_truth_snippets_map.get(q_id, set())
-        # Already sliced to top 10 in previous step if this function is called after exact match processing
-        # or needs to be sliced if called directly with full predicted_snippets_map
         pred_snippet_texts_top_k = predicted_snippets_map.get(q_id, [])[:10]
 
 
@@ -354,7 +347,6 @@ def main():
     k_for_mrr = 10 
 
     print("\\n--- Document Evaluation Metrics ---")
-    # Check if there's anything to evaluate for documents
     if not any(ground_truth_docs_map.values()) and not any(predicted_docs_map.values()):
          print("No document data found in ground truth or predictions to evaluate.")
     else:
@@ -367,15 +359,12 @@ def main():
         print(f"MRR@{k_for_mrr}: {doc_metrics[f'mrr@{k_for_mrr}']:.4f}")
 
     print("\\n--- Snippet Evaluation Metrics (Exact Match) ---")
-    # Check if there's anything to evaluate for snippets
     if not any(ground_truth_snippets_map.values()) and not any(predicted_snippets_map.values()):
          print("No snippet data found in ground truth or predictions to evaluate for exact match.")
     else:
-        # For exact match, predicted_snippets_map still contains lists of strings.
-        # calculate_metrics will handle the set conversion for its internal logic.
         exact_snippet_metrics = calculate_metrics(
-            ground_truth_snippets_map, # {qid: set of GT snippet strings}
-            predicted_snippets_map,    # {qid: list of predicted snippet strings}
+            ground_truth_snippets_map,
+            predicted_snippets_map,    
             k_mrr=k_for_mrr
         )
         print(f"Evaluated on {exact_snippet_metrics['evaluated_questions']} questions common for snippets (exact match).")
@@ -390,8 +379,8 @@ def main():
         print("No snippet data found in ground truth or predictions to evaluate for Jaccard match.")
     else:
         jaccard_snippet_metrics = calculate_snippet_metrics_jaccard(
-            ground_truth_snippets_map, # {qid: set of GT snippet strings}
-            predicted_snippets_map,    # {qid: list of predicted snippet strings}
+            ground_truth_snippets_map,
+            predicted_snippets_map,
             k_mrr=k_for_mrr,
             jaccard_threshold=0.5
         )

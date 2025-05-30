@@ -1,7 +1,6 @@
 import json
 import os
 
-# Function to extract PMID from a PubMed URL or just a PMID string
 def extract_pmid_from_url(identifier):
     """Extracts the PubMed ID (PMID) from a PubMed URL or returns if it's already a PMID."""
     if isinstance(identifier, str):
@@ -40,20 +39,19 @@ def load_ground_truth(filepath, debug_mode=False, debug_limit=5):
                     }
     except FileNotFoundError:
         print(f"Error: Ground truth file not found at {filepath}")
-        return None  # Indicate failure clearly
+        return None 
     except json.JSONDecodeError:
         print(f"Error: Could not decode JSON from {filepath}")
-        return None  # Indicate failure clearly
+        return None 
     except Exception as e:
         print(f"An unexpected error occurred while loading ground truth: {e}")
-        return None  # Indicate failure clearly
+        return None
 
     if not ground_truth:
         print("Warning: No valid ground truth data loaded.")
 
     return ground_truth
 
-# Function to calculate precision, recall, and F1-score
 def calculate_precision_recall_f1(retrieved_pmids, relevant_pmids):
     """Calculates Precision@k, Recall@k, and F1@k."""
     if not relevant_pmids:  # Avoid division by zero if no relevant documents exist
@@ -71,7 +69,6 @@ def calculate_precision_recall_f1(retrieved_pmids, relevant_pmids):
 
     return precision, recall, f1
 
-# Function for Jaccard-based snippet matching
 def match_snippets_jaccard(predicted_snips, gold_snips, threshold=0.5):
     """Matches predicted snippets to gold snippets using Jaccard similarity."""
     matched = set()
@@ -122,7 +119,7 @@ def evaluate_predictions(predictions_filepath, ground_truth_filepath, debug_mode
             relevant_snips = gt["snippets"]
 
             doc_precision, doc_recall, doc_f1 = calculate_precision_recall_f1(predicted_pmids, relevant_pmids)
-            snip_precision, snip_recall, snip_f1 = match_snippets_jaccard(predicted_snips, relevant_snips, threshold=0.5) #calculate_precision_recall_f1(predicted_snips, relevant_snips)
+            snip_precision, snip_recall, snip_f1 = match_snippets_jaccard(predicted_snips, relevant_snips, threshold=0.5)
 
             print(f"Q: {question_body[:60]}...")
             print(f"Documents - Precision: {doc_precision:.4f}, Recall: {doc_recall:.4f}, F1: {doc_f1:.4f}")

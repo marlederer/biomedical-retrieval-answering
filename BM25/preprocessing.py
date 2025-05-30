@@ -2,9 +2,6 @@ import nltk
 from nltk.corpus import stopwords
 from nltk.tokenize import word_tokenize
 
-# Download necessary NLTK data if not already present
-# Note: It's often better to handle downloads once in the main script or setup
-# but keeping them here makes the module self-contained for simple cases.
 try:
     nltk.data.find('corpora/stopwords')
 except nltk.downloader.DownloadError:

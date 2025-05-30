@@ -5,5 +5,5 @@
   "debug_mode": true,
   "debug_limit": 100,
   "output_mode": "json",
-  "input_questions_filepath": "../training13b.json"
+  "input_questions_filepath": "../data/training13b.json"
 }

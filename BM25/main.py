@@ -1,18 +1,15 @@
 import os
-import sys # Import sys for exit
-import json # Import json for loading config
+import sys
+import json
 
-# Import functions from our refactored modules using relative imports
 from keyword_extractor import extract_keyword_combinations
-from api_client import search_pubmed, fetch_pubmed_details # Updated import
-from ranker import rank_articles_bm25, rank_snippets_bm25 # Added rank_snippets_bm25
+from api_client import search_pubmed, fetch_pubmed_details
+from ranker import rank_articles_bm25, rank_snippets_bm25
 from evaluation import calculate_precision_recall_f1, extract_pmid_from_url
 
-# --- Configuration Loading ---
-script_dir = os.path.dirname(__file__) # Get the directory where the script is located
+
+script_dir = os.path.dirname(__file__)
 config_filepath = os.path.join(script_dir, 'config.json')
-# The ground_truth_filepath is now the input file for questions
-# input_questions_filepath = os.path.join(script_dir, '..', 'training13b.json') # Remove this line
 
 try:
     with open(config_filepath, 'r') as f:
@@ -30,18 +27,15 @@ num_candidates_per_combination = config.get("num_candidates_per_combination", 10
 num_final_results = config.get("num_final_results", 10)
 debug_mode = config.get("debug_mode", False)
 debug_limit = config.get("debug_limit", 5)
-output_mode = config.get("output_mode", "evaluation") # New setting: "evaluation" or "json"
-input_questions_filepath_config = config.get("input_questions_filepath", "../training13b.json") # Default if not in config
+output_mode = config.get("output_mode", "evaluation")
+input_questions_filepath_config = config.get("input_questions_filepath", "../training13b.json")
 
-# Resolve the input questions filepath relative to the script directory
 input_questions_filepath = os.path.abspath(os.path.join(script_dir, input_questions_filepath_config))
 
 
-# --- Main Orchestration ---
 
 if __name__ == "__main__":
 
-    # Load raw input questions data
     print(f"Loading input questions from: {input_questions_filepath}")
     try:
         with open(input_questions_filepath, 'r', encoding='utf-8') as f:
@@ -82,7 +76,6 @@ if __name__ == "__main__":
             seen_article_pmids = set()
 
             for combo in keyword_combinations_list:
-                # Updated API call to use search_pubmed and fetch_pubmed_details
                 pmids_from_search = search_pubmed(combo, max_results=num_candidates_per_combination)
                 candidate_articles_from_api = []
                 if pmids_from_search:
@@ -90,10 +83,9 @@ if __name__ == "__main__":
                 
                 if candidate_articles_from_api:
                     for article in candidate_articles_from_api:
-                        pmid = article.get('id') # 'id' from fetch_pubmed_details is the PMID
+                        pmid = article.get('id') 
                         if pmid and pmid not in seen_article_pmids:
-                            article['pmid'] = pmid # Ensure 'pmid' key exists for downstream code
-                            # URL is already set by fetch_pubmed_details, no need to reconstruct unless missing
+                            article['pmid'] = pmid 
                             if 'url' not in article or not article['url']:
                                 article['url'] = f"http://www.ncbi.nlm.nih.gov/pubmed/{pmid}"
                             all_candidate_articles.append(article)
@@ -116,15 +108,14 @@ if __name__ == "__main__":
 
                 if ranked_articles_for_output:
                     first_ranked_article = ranked_articles_for_output[0]
-                    # Prefer abstract, then title, then empty string for snippet text
                     doc_text_content = first_ranked_article.get('abstract', '')
-                    if not doc_text_content: # If abstract is empty or not present
+                    if not doc_text_content:
                         doc_text_content = first_ranked_article.get('title', '')
                     
                     snippet_text = doc_text_content[:150]
                     snippet_document_url = first_ranked_article.get('url')
 
-                    if snippet_document_url: # Only add snippet if document URL exists
+                    if snippet_document_url:
                         output_snippets_list.append({
                             "document": snippet_document_url,
                             "text": snippet_text,
@@ -155,9 +146,9 @@ if __name__ == "__main__":
         total_precision = 0
         total_recall = 0
         total_f1 = 0
-        total_snippet_precision = 0 # Added for snippet evaluation
-        total_snippet_recall = 0    # Added for snippet evaluation
-        total_snippet_f1 = 0        # Added for snippet evaluation
+        total_snippet_precision = 0 
+        total_snippet_recall = 0    
+        total_snippet_f1 = 0        
         processed_questions_count = 0
         questions_with_results = 0
 
@@ -174,7 +165,7 @@ if __name__ == "__main__":
                 for snip in input_question_obj['snippets']:
                     if isinstance(snip, dict) and 'text' in snip:
                         ideal_snippets_text.append(snip['text'])
-                    elif isinstance(snip, str): # Legacy format where snippets might be just strings
+                    elif isinstance(snip, str):
                         ideal_snippets_text.append(snip)
 
             print("-" * 40)
@@ -182,14 +173,12 @@ if __name__ == "__main__":
             processed_questions_count += 1
 
             keyword_combinations_list = extract_keyword_combinations(question_body)
-            # ... (rest of the original code for fetching and ranking, adapted) ...
             all_candidate_articles = []
             seen_article_ids = set() 
             # print(f"Fetching top {num_candidates_per_combination} candidates per keyword combination...")
 
             for combo in keyword_combinations_list:
                 # print(f"  Fetching for combination: '{combo}'")
-                # Updated API call to use search_pubmed and fetch_pubmed_details
                 pmids_from_search = search_pubmed(combo, max_results=num_candidates_per_combination)
                 candidate_articles_from_api = []
                 if pmids_from_search:
@@ -198,10 +187,9 @@ if __name__ == "__main__":
                 if candidate_articles_from_api:
                     # print(f"    Retrieved {len(candidate_articles_from_api)} candidates for '{combo}'.")
                     for article in candidate_articles_from_api:
-                        pmid = article.get('id') # 'id' from fetch_pubmed_details is the PMID
+                        pmid = article.get('id')
                         if pmid and pmid not in seen_article_ids:
-                            article['pmid'] = pmid # Ensure 'pmid' key exists for downstream code
-                             # URL is already set by fetch_pubmed_details, no need to reconstruct unless missing
+                            article['pmid'] = pmid
                             if 'url' not in article or not article['url']:
                                 article['url'] = f"http://www.ncbi.nlm.nih.gov/pubmed/{pmid}"
                             all_candidate_articles.append(article)
@@ -211,18 +199,13 @@ if __name__ == "__main__":
                 # print(f"Retrieved {len(all_candidate_articles)} unique candidate articles in total.")
                 # print("Ranking candidates locally using BM25...")
                 final_top_pmids = rank_articles_bm25(question_body, all_candidate_articles, top_k=num_final_results)
-                # Ensure final_top_pmids are strings for comparison
                 final_top_pmids_str = set(map(str, final_top_pmids))
 
                 precision, recall, f1 = calculate_precision_recall_f1(final_top_pmids_str, relevant_pmids_str)
 
-                # Snippet Ranking and Evaluation
-                ranked_snippets_data = rank_snippets_bm25(question_body, all_candidate_articles, top_k=num_final_results) # Using num_final_results for snippets too
+                ranked_snippets_data = rank_snippets_bm25(question_body, all_candidate_articles, top_k=num_final_results)
                 predicted_snippets_text = [snippet_data['snippet'] for snippet_data in ranked_snippets_data]
                 
-                # For snippet evaluation, we treat each snippet as a "document"
-                # We need to define how to match predicted snippets to ideal snippets (e.g., exact match, high overlap)
-                # For simplicity, using exact match here. More sophisticated matching might be needed.
                 snippet_precision, snippet_recall, snippet_f1 = calculate_precision_recall_f1(set(predicted_snippets_text), set(ideal_snippets_text))
 
                 print("-" * 40)

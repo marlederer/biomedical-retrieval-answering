@@ -3,7 +3,6 @@ from nltk.corpus import stopwords
 from nltk.tokenize import word_tokenize
 from itertools import combinations
 
-# Download necessary NLTK data if not already present
 try:
     nltk.data.find('corpora/stopwords')
 except Exception as e:
@@ -34,7 +33,5 @@ def extract_keyword_combinations(question_text):
     keyword_triplets = list(combinations(filtered_tokens, 3))
     triplet_strings = [" ".join(triplet) for triplet in keyword_triplets]
 
-
-    # Combine all combinations
     all_combinations = single_keywords + string_of_keywords + pair_strings + triplet_strings
     return all_combinations

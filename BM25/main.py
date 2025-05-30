@@ -145,7 +145,7 @@ if __name__ == "__main__":
             }
             all_output_question_data.append(question_output_entry)
 
-        output_json_filename = "bioasq_output.json"
+        output_json_filename = "bioasq_output_reranker.json"
         output_json_filepath = os.path.join(script_dir, output_json_filename)
         with open(output_json_filepath, 'w', encoding='utf-8') as outfile:
             json.dump({"questions": all_output_question_data}, outfile, indent=4)

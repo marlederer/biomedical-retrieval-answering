@@ -5,7 +5,7 @@
     "debug_mode": false,
     "debug_limit": 100,
     "output_mode": "evaluation",
-    "input_questions_filepath": "../training13b.json",
+    "input_questions_filepath": "../data/training13b.json",
     "predictions_filepath": "bioasq_output_first100test.json"
   }
   

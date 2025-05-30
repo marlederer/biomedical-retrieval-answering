@@ -15,7 +15,7 @@ from dense_retrieval import encode_contexts, encode_query, rank_with_dense_retri
 # --- Configuration Loading ---
 script_dir = os.path.dirname(__file__) # Get the directory where the script is located
 config_filepath = os.path.join(script_dir, 'config.json')
-ground_truth_filepath = os.path.join(script_dir, '..', 'training13b.json')
+ground_truth_filepath = os.path.join(script_dir, '..', 'data/training13b.json')
 
 try:
     with open(config_filepath, 'r') as f:

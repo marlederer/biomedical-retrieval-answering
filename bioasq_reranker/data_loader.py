@@ -6,6 +6,9 @@ import json
 import random
 import torch
 from torch.utils.data import Dataset, DataLoader
+import os # Added
+import requests # Ensure this import is present
+from bs4 import BeautifulSoup # Ensure this import is present
 
 import config
 from utils import tokenize_text, texts_to_sequences, pad_sequence, create_mask_from_sequence, Vocabulary
@@ -235,7 +238,64 @@ class BioASQPredictionDataset(Dataset):
             'original_doc': doc_text
         }
 
-def load_first_stage_rerank_data(filepath):
+def fetch_document_content(url):
+    """
+    Fetches the title and abstract of a PubMed article from its URL.
+    Returns a concatenated string "title\\nabstract" or None if fetching fails.
+    """
+    try:
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        }
+        response = requests.get(url, timeout=15, headers=headers)
+        response.raise_for_status()  # Raises an HTTPError for bad responses (4XX or 5XX)
+        soup = BeautifulSoup(response.content, 'html.parser')
+
+        title = ""
+        title_tag = soup.find('h1', class_='heading-title')
+        if title_tag:
+            title = title_tag.get_text(separator=' ', strip=True)
+        
+        abstract_text = ""
+        abstract_div = soup.find('div', class_='abstract-content')
+        if abstract_div:
+            # Try to get structured abstract if present
+            abstract_sections = abstract_div.find_all(['strong', 'p'], recursive=False)
+            if any(sec.name == 'strong' for sec in abstract_sections): # Likely structured abstract
+                current_section_text = []
+                for sec in abstract_sections:
+                    current_section_text.append(sec.get_text(separator=' ', strip=True))
+                abstract_text = "\\n".join(current_section_text)
+            else: # Unstructured or simple <p> tags
+                paragraphs = abstract_div.find_all('p')
+                abstract_text = "\\n".join([p.get_text(separator=' ', strip=True) for p in paragraphs])
+        
+        if not title and not abstract_text: # Fallback if specific tags are not found
+            title_tag_meta = soup.find('meta', attrs={'name': 'citation_title'})
+            if title_tag_meta and title_tag_meta.get('content'):
+                title = title_tag_meta.get('content')
+            
+            abstract_tag_meta = soup.find('meta', attrs={'name': 'citation_abstract'})
+            if abstract_tag_meta and abstract_tag_meta.get('content'):
+                abstract_text = abstract_tag_meta.get('content')
+
+        if title or abstract_text:
+            return f"{title}\\n{abstract_text}".strip()
+        else:
+            # print(f"Could not extract title/abstract from {url}")
+            return None
+
+    except requests.exceptions.Timeout:
+        print(f"Timeout while fetching {url}")
+        return None
+    except requests.exceptions.RequestException as e:
+        print(f"Error fetching {url}: {e}")
+        return None
+    except Exception as e:
+        print(f"Error parsing content from {url}: {e}")
+        return None
+
+def load_first_stage_rerank_data(filepath, vocab, fetch_content=False):
     """
     Loads data from a first-stage ranker (e.g., BM25 output) for reranking.
     Expected format: A list of questions, each with a 'body' (query) and 'documents' (list of URLs/IDs) 
@@ -243,6 +303,10 @@ def load_first_stage_rerank_data(filepath):
                      The reranker will typically rerank these snippets.
     Or, a simpler list of {query_id: str, query_text: str, candidates: [{doc_id: str, doc_text: str, score: float}, ...]}
     This function adapts to the BM25/Dense output structure you provided.
+
+    Args:
+        filepath (str): Path to the first-stage ranker output file.
+        fetch_content (bool): If True, fetches content from document URLs.
     """
     queries_for_rerank = []
     candidate_docs_for_rerank = []
@@ -260,29 +324,62 @@ def load_first_stage_rerank_data(filepath):
         # Assuming snippets are the candidates to rerank
         # And that the `documents` list in BM25/Dense output corresponds to these snippets by order/URI.
         # The `snippets` themselves contain the text.
-        snippets = question_item.get('snippets', [])
+        # snippets = question_item.get('snippets', []) # Original line
+        document_urls = question_item.get('documents', []) # Use the full list of document URLs
         
-        if not query_text or not snippets:
+        # if not query_text or not snippets: # Original line
+        if not query_text or not document_urls:
             continue
 
-        for snippet_data in snippets:
-            doc_text = snippet_data.get('text')
-            # Try to get a unique doc identifier, e.g. from document URL in snippet
-            doc_id = snippet_data.get('document', f"snippet_offset_{snippet_data.get('offsetInBeginSection')}_{snippet_data.get('offsetInEndSection')}") 
-            if doc_text:
+        # for snippet_data in snippets: # Original line
+        # Limit to top 100 as per user request, though input file already has top 100
+        for doc_url in document_urls[:100]: 
+            doc_text_to_use = None
+            if fetch_content:
+                print(f"Fetching content for {doc_url}...")
+                fetched_text = fetch_document_content(doc_url)
+                if fetched_text:
+                    doc_text_to_use = fetched_text
+                else:
+                    print(f"Warning: Could not fetch content for {doc_url}. Skipping this document for query {query_id}.")
+                    # Fallback to snippet text if fetching fails, though the user wants full text
+                    # This part needs to align with how snippets are structured if we want a fallback
+                    # For now, if fetch fails and no snippet, it will be skipped.
+                    corresponding_snippet = next((s for s in question_item.get('snippets', []) if s.get('document') == doc_url), None)
+                    if corresponding_snippet and corresponding_snippet.get('text'):
+                        print(f"Falling back to snippet text for {doc_url}")
+                        doc_text_to_use = corresponding_snippet.get('text')
+                    else:
+                        print(f"No content fetched and no fallback snippet text for {doc_url}. Skipping.")
+                        continue # Skip if no content could be obtained
+            else:
+                # Fallback to using snippet text if fetch_content is False or if not implemented yet
+                # This requires matching doc_url to snippet_data['document']
+                corresponding_snippet = next((s for s in question_item.get('snippets', []) if s.get('document') == doc_url), None)
+                if corresponding_snippet and corresponding_snippet.get('text'):
+                    doc_text_to_use = corresponding_snippet.get('text')
+                else:
+                    # If no snippet text and not fetching, we can't process this document
+                    print(f"Warning: No snippet text for {doc_url} and not fetching content. Skipping for query {query_id}.")
+                    continue
+            
+            # doc_text = snippet_data.get('text') # Original line
+            # doc_id = snippet_data.get('document', f"snippet_offset_{snippet_data.get('offsetInBeginSection')}_{snippet_data.get('offsetInEndSection')}") # Original line
+            
+            if doc_text_to_use:
                 queries_for_rerank.append(query_text)
-                candidate_docs_for_rerank.append(doc_text)
+                candidate_docs_for_rerank.append(doc_text_to_use)
                 query_doc_pairs_info.append({
                     'query_id': query_id,
                     'query_text': query_text,
-                    'doc_id': doc_id, # This is the URL or a generated ID
-                    'doc_text': doc_text
+                    'doc_id': doc_url, # Use the URL as the doc_id
+                    'doc_text': doc_text_to_use
                 })
                 
     return queries_for_rerank, candidate_docs_for_rerank, query_doc_pairs_info
 
-def get_inference_dataloader(data_filepath, vocab, batch_size=config.BATCH_SIZE):
-    queries, docs, pairs_info = load_first_stage_rerank_data(data_filepath)
+def get_inference_dataloader(data_filepath, vocab, batch_size=config.BATCH_SIZE, fetch_content=False):
+    queries, docs, pairs_info = load_first_stage_rerank_data(data_filepath, fetch_content=fetch_content)
     if not queries:
         print(f"No query-document pairs loaded from {data_filepath} for inference.")
         return None, None
@@ -342,19 +439,24 @@ if __name__ == '__main__':
     # Ensure BM25_OUTPUT_PATH in config.py points to a valid BM25 output file
     # Create a dummy BM25 output if it doesn't exist for testing
     dummy_bm25_output_path = config.BM25_OUTPUT_PATH
-    try:
-        with open(dummy_bm25_output_path, 'r') as f:
-            pass # Check if file exists
-    except FileNotFoundError:
+    # Ensure the dummy file actually exists for the example to run without error if config.BM25_OUTPUT_PATH is used.
+    if not os.path.exists(dummy_bm25_output_path):
         print(f"Warning: BM25 output {dummy_bm25_output_path} not found. Creating a dummy one for example.")
         dummy_data = {"questions": [
-            {"id": "q1_test", "body": "test query one", "snippets": [{"text": "relevant document for q1", "document": "doc1_url"}]},
-            {"id": "q2_test", "body": "test query two", "snippets": [{"text": "document for q2", "document": "doc2_url"}]}
+            {"id": "q1_test", "body": "test query one", 
+             "documents": ["http://example.com/doc1"], # Added document URL for dummy data
+             "snippets": [{"text": "relevant document for q1", "document": "http://example.com/doc1"}]},
+            {"id": "q2_test", "body": "test query two", 
+             "documents": ["http://example.com/doc2"], # Added document URL for dummy data
+             "snippets": [{"text": "document for q2", "document": "http://example.com/doc2"}]}
         ]}
+        # Create directory if it doesn't exist
+        os.makedirs(os.path.dirname(dummy_bm25_output_path), exist_ok=True)
         with open(dummy_bm25_output_path, 'w') as f:
             json.dump(dummy_data, f)
-
-    inference_loader, inference_pairs_info = get_inference_dataloader(dummy_bm25_output_path, vocab_obj, batch_size=2)
+    
+    # Test with fetch_content=True for the example run
+    inference_loader, inference_pairs_info = get_inference_dataloader(dummy_bm25_output_path, vocab_obj, batch_size=2, fetch_content=True)
     if inference_loader:
         print(f"Inference DataLoader created. Number of batches: {len(inference_loader)}")
         for i, batch in enumerate(inference_loader):

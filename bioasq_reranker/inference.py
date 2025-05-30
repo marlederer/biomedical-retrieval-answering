@@ -10,29 +10,91 @@ import torch
 import json
 from tqdm import tqdm
 import argparse
-from collections import defaultdict
+# defaultdict removed as full JSON output is commented out
+import requests
+from bs4 import BeautifulSoup
+from concurrent.futures import ThreadPoolExecutor, as_completed # Added import
 
 import config
 from knrm import KNRM
-from data_loader import Vocabulary, get_inference_dataloader
-from metrics import calculate_mrr # For potential evaluation if ground truth is available
+from data_loader import fetch_document_content # Assuming this is correctly placed and working
+from utils import Vocabulary, texts_to_sequences, pad_sequence, create_mask_from_sequence, tokenize_text # Updated import
+from metrics import calculate_mrr
 
 def ensure_dir(directory):
     if not os.path.exists(directory):
         os.makedirs(directory)
 
+# Function to fetch document content (moved here for simplicity for this script)
+def fetch_document_content(url: str):
+    """
+    Fetches the title and abstract of a PubMed article from its URL.
+    Returns a concatenated string "title\\nabstract" or None if fetching fails.
+    """
+    try:
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        }
+        response = requests.get(url, timeout=15, headers=headers)
+        response.raise_for_status()  # Raises an HTTPError for bad responses (4XX or 5XX)
+        soup = BeautifulSoup(response.content, 'html.parser')
+
+        title = ""
+        title_tag = soup.find('h1', class_='heading-title')
+        if title_tag:
+            title = title_tag.get_text(separator=' ', strip=True)
+        
+        abstract_text = ""
+        abstract_div = soup.find('div', class_='abstract-content')
+        if abstract_div:
+            # Try to get structured abstract if present
+            abstract_sections = abstract_div.find_all(['strong', 'p'], recursive=False)
+            if any(sec.name == 'strong' for sec in abstract_sections): # Likely structured abstract
+                current_section_text = []
+                for sec in abstract_sections:
+                    current_section_text.append(sec.get_text(separator=' ', strip=True))
+                abstract_text = "\\n".join(current_section_text)
+            else: # Unstructured or simple <p> tags
+                paragraphs = abstract_div.find_all('p')
+                abstract_text = "\\n".join([p.get_text(separator=' ', strip=True) for p in paragraphs])
+        
+        if not title and not abstract_text: # Fallback if specific tags are not found
+            title_tag_meta = soup.find('meta', attrs={'name': 'citation_title'})
+            if title_tag_meta and title_tag_meta.get('content'):
+                title = title_tag_meta.get('content')
+            
+            abstract_tag_meta = soup.find('meta', attrs={'name': 'citation_abstract'})
+            if abstract_tag_meta and abstract_tag_meta.get('content'):
+                abstract_text = abstract_tag_meta.get('content')
+
+        if title or abstract_text:
+            return f"{title}\\n{abstract_text}".strip()
+        else:
+            # print(f"Could not extract title/abstract from {url}")
+            return None
+
+    except requests.exceptions.Timeout:
+        print(f"Timeout while fetching {url}")
+        return None
+    except requests.exceptions.RequestException as e:
+        print(f"Error fetching {url}: {e}")
+        return None
+    except Exception as e:
+        print(f"Error parsing content from {url}: {e}")
+        return None
+
 def rerank_documents(
     model_path,
     vocab_path,
     input_retrieval_path, # Path to the output of BM25/Dense (e.g., bioasq_output.json)
-    output_reranked_path,
+    output_reranked_path, # Path to save reranked output (currently commented out)
     ground_truth_path=None # Optional: path to BioASQ JSON with ground truth for MRR calc
 ):
     print(f"Loading vocabulary from {vocab_path}...")
     try:
         vocab = Vocabulary.load(vocab_path)
     except FileNotFoundError:
-        print(f"ERROR: Vocabulary file not found at {vocab_path}. Please ensure it's created (e.g., by running train.py or data_loader.py first).")
+        print(f"ERROR: Vocabulary file not found at {vocab_path}. Please ensure it's created.")
         return
     print(f"Vocabulary loaded. Size: {len(vocab)}")
 
@@ -50,123 +112,209 @@ def rerank_documents(
         return
     except Exception as e:
         print(f"Error loading model state_dict: {e}")
-        print("This could be due to a mismatch in model architecture or a corrupted file.")
         return
-        
     model.eval()
     print("Model loaded.")
 
     print(f"Loading inference data from {input_retrieval_path}...")
-    inference_dataloader, query_doc_pairs_info = get_inference_dataloader(
-        input_retrieval_path, vocab, batch_size=config.BATCH_SIZE
-    )
-
-    if not inference_dataloader:
-        print(f"Could not create inference dataloader. Check {input_retrieval_path}.")
+    try:
+        with open(input_retrieval_path, 'r', encoding='utf-8') as f:
+            all_questions_data = json.load(f)
+    except FileNotFoundError:
+        print(f"ERROR: Input retrieval file not found at {input_retrieval_path}.")
+        return
+    except json.JSONDecodeError:
+        print(f"ERROR: Could not decode JSON from {input_retrieval_path}.")
         return
 
-    print("Starting inference and reranking...")
-    results = [] # To store (query_id, doc_id, score, original_doc_text)
-    all_scores_for_pairs = [] # List of tuples (query_text, doc_text, score)
+    questions_to_process = all_questions_data.get('questions', [])
+    if not questions_to_process:
+        print("No questions found in the input file.")
+        return
 
-    with torch.no_grad():
-        progress_bar = tqdm(inference_dataloader, desc="Reranking")
-        for i, batch in enumerate(progress_bar):
-            query_ids = batch['query_ids'].to(config.DEVICE)
-            query_mask = batch['query_mask'].to(config.DEVICE)
-            doc_ids = batch['doc_ids'].to(config.DEVICE)
-            doc_mask = batch['doc_mask'].to(config.DEVICE)
-            
-            original_queries = batch['original_query']
-            original_docs = batch['original_doc']
-
-            scores = model(query_ids, doc_ids, query_mask, doc_mask)
-            scores = scores.squeeze(-1).cpu().tolist() # Squeeze and move to CPU
-
-            # The query_doc_pairs_info from get_inference_dataloader is flat.
-            # We need to map scores back to the correct (query_id, doc_id) from that flat list.
-            # The dataloader processes items sequentially, so we can use the batch index and size.
-            start_idx = i * config.BATCH_SIZE
-            for j in range(len(scores)):
-                current_pair_idx = start_idx + j
-                if current_pair_idx < len(query_doc_pairs_info):
-                    pair_info = query_doc_pairs_info[current_pair_idx]
-                    results.append({
-                        'query_id': pair_info['query_id'],
-                        'query_text': pair_info['query_text'],
-                        'doc_id': pair_info['doc_id'], # This is often a URL or a generated ID
-                        'doc_text': pair_info['doc_text'],
-                        'rerank_score': scores[j]
-                    })
-                    all_scores_for_pairs.append((pair_info['query_text'], pair_info['doc_text'], scores[j]))
-    
-    # Group results by query_id and sort documents by rerank_score
-    reranked_output_dict = defaultdict(list)
-    for res_item in results:
-        reranked_output_dict[res_item['query_id']].append(res_item)
-
-    final_bioasq_structure = {"questions": []}
-    for q_id, doc_infos in reranked_output_dict.items():
-        # Sort documents for this query by the new rerank_score in descending order
-        sorted_doc_infos = sorted(doc_infos, key=lambda x: x['rerank_score'], reverse=True)
-        
-        # Reconstruct the BioASQ output format
-        # We need the original query body. We can get it from the first item (all items for a q_id have same query_text)
-        query_body = sorted_doc_infos[0]['query_text'] if sorted_doc_infos else ""
-        
-        question_output = {
-            "id": q_id,
-            "body": query_body,
-            "documents": [info['doc_id'] for info in sorted_doc_infos], # List of doc URLs/IDs
-            "snippets": [
-                {
-                    "document": info['doc_id'],
-                    "text": info['doc_text'],
-                    "score_reranked": info['rerank_score'] 
-                    # You might want to add original BM25/Dense score here if available in query_doc_pairs_info
-                } for info in sorted_doc_infos
-            ]
-        }
-        final_bioasq_structure["questions"].append(question_output)
-
-    # Save the reranked results
-    ensure_dir(os.path.dirname(output_reranked_path))
-    with open(output_reranked_path, 'w', encoding='utf-8') as f:
-        json.dump(final_bioasq_structure, f, indent=4)
-    print(f"Reranked results saved to {output_reranked_path}")
-
-    # --- Optional: Calculate MRR if ground truth is provided ---
+    # Load ground truth data once if path is provided
+    relevant_docs_map_gt = {}
     if ground_truth_path:
-        print(f"Calculating MRR@{config.MRR_K} using ground truth from {ground_truth_path}...")
+        print(f"Loading ground truth from {ground_truth_path}...")
         try:
             with open(ground_truth_path, 'r', encoding='utf-8') as f:
-                gt_data = json.load(f).get('questions', [])
-            
-            relevant_docs_map_gt = {}
-            for q_data in gt_data:
-                # Assuming ground truth relevant documents are identified by their URLs/IDs in 'documents' field
-                # and these IDs match what's in our 'doc_id' from the reranked results.
-                relevant_docs_map_gt[q_data['id']] = set(s['document'] for s in q_data.get('snippets',[]))
-                # Or, if your ground truth has a simpler list of doc IDs:
-                # relevant_docs_map_gt[q_data['id']] = set(q_data.get('documents', []))
-
-            # Prepare ranked_lists for MRR calculation from our reranked output
-            ranked_lists_for_mrr = {}
-            for q_output in final_bioasq_structure['questions']:
-                ranked_lists_for_mrr[q_output['id']] = [doc_id for doc_id in q_output['documents']]
-
-            if not ranked_lists_for_mrr:
-                print("No reranked lists available to calculate MRR.")
-            elif not relevant_docs_map_gt:
-                print("No ground truth relevant documents loaded. Cannot calculate MRR.")
-            else:
-                mrr_score, _ = calculate_mrr(ranked_lists_for_mrr, relevant_docs_map_gt, k=config.MRR_K)
-                print(f"MRR@{config.MRR_K}: {mrr_score:.4f}")
-
+                gt_data_full = json.load(f)
+            for q_gt in gt_data_full.get('questions', []):
+                # BioASQ GT usually has relevant doc URLs in the 'documents' field
+                relevant_docs_map_gt[q_gt['id']] = set(q_gt.get('documents', []))
+            if not relevant_docs_map_gt:
+                print("Warning: Ground truth file loaded, but no relevant documents mapped. Check GT format.")
         except FileNotFoundError:
-            print(f"Ground truth file not found at {ground_truth_path}. Skipping MRR calculation.")
+            print(f"Warning: Ground truth file {ground_truth_path} not found. MRR cannot be calculated.")
+            ground_truth_path = None # Disable MRR calculation
+        except json.JSONDecodeError:
+            print(f"Warning: Could not decode JSON from ground truth file {ground_truth_path}. MRR cannot be calculated.")
+            ground_truth_path = None # Disable MRR calculation
         except Exception as e:
-            print(f"Error during MRR calculation: {e}")
+            print(f"Warning: Error loading ground truth data: {e}. MRR cannot be calculated.")
+            ground_truth_path = None
+
+    total_mrr_sum = 0.0
+    questions_with_gt_and_docs_count = 0
+    
+    # This list would store per-question outputs if saving the full JSON was enabled
+    # final_bioasq_questions_output = []
+
+    print("Starting per-question inference, reranking, and MRR calculation...")
+    for question_data in tqdm(questions_to_process, desc="Processing Questions"):
+        query_id = question_data.get('id')
+        query_text = question_data.get('body')
+
+        if not query_id or not query_text:
+            print("Skipping question due to missing ID or body.")
+            continue
+
+        # Get document URLs directly from the 'documents' field of the question
+        document_urls = question_data.get('documents', [])
+
+        if not document_urls:
+            print(f"No documents found in 'documents' list for question {query_id}. Skipping MRR calculation for this question.")
+            if ground_truth_path and query_id in relevant_docs_map_gt:
+                 print(f"MRR@{config.MRR_K} for question {query_id}: 0.0000 (no documents to rank)")
+            continue
+
+        current_question_docs_for_model = []
+        # Parallel fetching of document content
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            future_to_url = {executor.submit(fetch_document_content, doc_url): doc_url for doc_url in document_urls}
+            # Inner tqdm for document fetching progress for the current question
+            for future in tqdm(as_completed(future_to_url), total=len(document_urls), desc=f"Fetching docs for Q {query_id[:10]}...", leave=False):
+                doc_url = future_to_url[future]
+                try:
+                    content = future.result()
+                    if content: # Ensure there's some text
+                        current_question_docs_for_model.append({'url': doc_url, 'text': content, 'query_id': query_id})
+                    else:
+                        # Log that content couldn't be fetched and this doc is skipped
+                        print(f"Warning: No content fetched for document {doc_url} for question {query_id}. Document will not be included in reranking.")
+                except Exception as exc:
+                    print(f"Warning: Document {doc_url} generated an exception during fetching: {exc}. Document will not be included in reranking.")
+
+
+        if not current_question_docs_for_model:
+            print(f"No document content could be prepared for question {query_id}. Skipping MRR calculation for this question.")
+            if ground_truth_path and query_id in relevant_docs_map_gt:
+                print(f"MRR@{config.MRR_K} for question {query_id}: 0.0000 (no document content)")
+            continue
+            
+        # Tokenize query
+        query_tokens = tokenize_text(query_text, config.TOKENIZER_TYPE) # Corrected line
+        # q_ids_tensor, q_mask_tensor = vocab.prepare_tensor(query_tokens, config.MAX_QUERY_LEN, config.DEVICE) # Old problematic line
+        query_seq = texts_to_sequences([query_tokens], vocab)[0]
+        padded_query_seq = pad_sequence(query_seq, config.MAX_QUERY_LEN, pad_value=vocab.word2idx[vocab.pad_token])
+        query_mask = create_mask_from_sequence(padded_query_seq, pad_idx=vocab.word2idx[vocab.pad_token])
+        
+        q_ids_tensor = torch.tensor(padded_query_seq, dtype=torch.long).to(config.DEVICE)
+        q_mask_tensor = torch.tensor(query_mask, dtype=torch.float32).to(config.DEVICE) # KNRM expects float mask
+        
+        num_docs_for_query = len(current_question_docs_for_model)
+        batch_query_ids = q_ids_tensor.unsqueeze(0).repeat(num_docs_for_query, 1)
+        batch_query_mask = q_mask_tensor.unsqueeze(0).repeat(num_docs_for_query, 1)
+
+        # Tokenize documents for the current query
+        doc_ids_list = []
+        doc_mask_list = []
+        for doc_content in current_question_docs_for_model:
+            doc_tokens = tokenize_text(doc_content['text'], config.TOKENIZER_TYPE) # Corrected line
+            # d_ids_tensor, d_mask_tensor = vocab.prepare_tensor(doc_tokens, config.MAX_DOC_LEN, config.DEVICE) # Old problematic line
+            doc_seq = texts_to_sequences([doc_tokens], vocab)[0]
+            padded_doc_seq = pad_sequence(doc_seq, config.MAX_DOC_LEN, pad_value=vocab.word2idx[vocab.pad_token])
+            doc_mask = create_mask_from_sequence(padded_doc_seq, pad_idx=vocab.word2idx[vocab.pad_token])
+
+            d_ids_tensor = torch.tensor(padded_doc_seq, dtype=torch.long).to(config.DEVICE)
+            d_mask_tensor = torch.tensor(doc_mask, dtype=torch.float32).to(config.DEVICE) # KNRM expects float mask
+            
+            doc_ids_list.append(d_ids_tensor)
+            doc_mask_list.append(d_mask_tensor)
+        
+        batch_doc_ids = torch.stack(doc_ids_list)
+        batch_doc_mask = torch.stack(doc_mask_list)
+
+        # Get scores from model
+        with torch.no_grad():
+            scores_tensor = model(batch_query_ids, batch_doc_ids, batch_query_mask, batch_doc_mask)
+        
+        scores_list = scores_tensor.squeeze(-1).cpu().tolist()
+
+        # Combine scores with document info for sorting
+        scored_docs_for_this_question = []
+        for i, doc_data in enumerate(current_question_docs_for_model):
+            scored_docs_for_this_question.append({
+                'doc_id': doc_data['url'], 
+                'doc_text': doc_data['text'], # Keeping text for potential future use / debugging
+                'rerank_score': scores_list[i]
+            })
+        
+        # Sort documents by new rerank_score
+        sorted_docs = sorted(scored_docs_for_this_question, key=lambda x: x['rerank_score'], reverse=True)
+
+        # --- (Optional) Reconstruct BioASQ structure for this question for full output file ---
+        # This part is commented out as per the focus on MRR.
+        # question_output_for_json = {
+        #     "id": query_id,
+        #     "body": query_text,
+        #     "documents": [info['doc_id'] for info in sorted_docs],
+        #     "snippets": [
+        #         {
+        #             "document": info['doc_id'],
+        #             "text": info['doc_text'], # Could be fetched or original snippet
+        #             "score_reranked": info['rerank_score']
+        #         } for info in sorted_docs
+        #     ]
+        # }
+        # final_bioasq_questions_output.append(question_output_for_json)
+        # --- End of optional JSON output part ---
+
+        # Calculate and print MRR for this question if ground truth is available
+        if ground_truth_path and query_id in relevant_docs_map_gt:
+            ranked_list_ids = [d['doc_id'] for d in sorted_docs]
+            gt_relevant_set_for_query = relevant_docs_map_gt[query_id]
+
+            if not gt_relevant_set_for_query: # No relevant docs in GT for this query
+                print(f"MRR@{config.MRR_K} for question {query_id}: N/A (no relevant documents in ground truth)")
+            elif not ranked_list_ids: # No documents were ranked (e.g. all failed fetching)
+                 print(f"MRR@{config.MRR_K} for question {query_id}: 0.0000 (no documents were ranked)")
+            else:
+                # calculate_mrr expects dicts, so wrap the single query's data
+                _, per_query_mrr_dict = calculate_mrr(
+                    {query_id: ranked_list_ids},
+                    {query_id: gt_relevant_set_for_query},
+                    k=config.MRR_K
+                )
+                
+                q_mrr_score = per_query_mrr_dict.get(query_id, 0.0) # Default to 0 if not calculable
+                print(f"MRR@{config.MRR_K} for question {query_id}: {q_mrr_score:.4f}")
+                total_mrr_sum += q_mrr_score
+                questions_with_gt_and_docs_count += 1
+        elif ground_truth_path: # GT was provided, but not for this specific query_id
+            print(f"No ground truth found for question {query_id}. Skipping MRR calculation for this question.")
+        # If no ground_truth_path, MRR calculation is skipped silently for each question.
+
+    # --- (Optional) Save the full reranked results ---
+    # This part is commented out.
+    # if final_bioasq_questions_output:
+    #     final_bioasq_structure_to_save = {"questions": final_bioasq_questions_output}
+    #     ensure_dir(os.path.dirname(output_reranked_path))
+    #     with open(output_reranked_path, 'w', encoding='utf-8') as f:
+    #         json.dump(final_bioasq_structure_to_save, f, indent=4)
+    #     print(f"Full reranked results saved to {output_reranked_path}")
+    # --- End of optional save part ---
+
+    # After processing all questions, print average MRR
+    if ground_truth_path: # Only print average if GT was attempted
+        if questions_with_gt_and_docs_count > 0:
+            average_mrr_overall = total_mrr_sum / questions_with_gt_and_docs_count
+            print(f"\\nAverage MRR@{config.MRR_K} over {questions_with_gt_and_docs_count} questions: {average_mrr_overall:.4f}")
+        else:
+            print(f"\\nNo MRR scores were calculated for any question (or no questions had ground truth and processable documents). Average MRR@{config.MRR_K} is not applicable.")
+    else:
+        print("\\nGround truth path not provided. MRR calculation was skipped.")
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Rerank documents using a trained KNRM model.")
@@ -211,9 +359,12 @@ if __name__ == '__main__':
             input_file_to_use = config.DENSE_OUTPUT_PATH
         else:
             print(f"Warning: Dummy input retrieval data created at 'dummy_retrieval_input.json' for inference script execution.")
+            # Ensure dummy data has 'documents' field for URLs
             dummy_retrieval_data = {"questions": [
                 {"id": "q1_infer", "body": "test query for inference", 
-                 "snippets": [{"text": "sample document one", "document": "doc_url_1"}, {"text": "sample document two", "document": "doc_url_2"}]}
+                 "documents": ["http://example.com/doc1", "http://example.com/doc2"], # Added documents field
+                 "snippets": [{"text": "sample document one", "document": "http://example.com/doc1"}, 
+                              {"text": "sample document two", "document": "http://example.com/doc2"}]}
             ]}
             input_file_to_use = "dummy_retrieval_input.json"
             with open(input_file_to_use, 'w') as f:

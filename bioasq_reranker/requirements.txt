@@ -2,3 +2,5 @@ torch
 nltk
 numpy
 tqdm
+requests
+beautifulsoup4

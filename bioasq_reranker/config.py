@@ -15,6 +15,7 @@ EMBEDDING_DIM = 100 # Dimension of word embeddings
 N_KERNELS = 15 # Number of RBF kernels in KNRM
 MAX_QUERY_LEN = 30 # Max length for query sequences
 MAX_DOC_LEN = 200 # Max length for document sequences
+MAX_DOCS_PER_QUERY = 100 # Max number of documents to consider per query
 
 # Training parameters
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")

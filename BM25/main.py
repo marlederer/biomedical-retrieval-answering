@@ -60,7 +60,7 @@ if __name__ == "__main__":
 
     if output_mode == "json":
         all_output_question_data = []
-        print(f"\\nStarting JSON generation for {len(input_questions_list)} questions...")
+        print(f"Starting JSON generation for {len(input_questions_list)} questions...")
 
         for idx, input_question_obj in enumerate(input_questions_list):
             question_id = input_question_obj['id']

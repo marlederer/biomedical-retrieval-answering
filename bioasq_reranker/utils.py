@@ -10,10 +10,10 @@ from nltk.tokenize import word_tokenize
 import config
 
 # Ensure NLTK's punkt tokenizer is downloaded if using NLTK
-# try:
-#     nltk.data.find('tokenizers/punkt')
-# except nltk.downloader.DownloadError:
-#     nltk.download('punkt')
+try:
+    nltk.data.find('tokenizers/punkt')
+except nltk.downloader.DownloadError:
+    nltk.download('punkt')
 
 class Vocabulary:
     def __init__(self, pad_token=config.PAD_TOKEN, unk_token=config.UNK_TOKEN):

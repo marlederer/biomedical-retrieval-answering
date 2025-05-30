@@ -31,19 +31,18 @@ class KNRM(nn.Module):
             self.vocab_size = vocab_size
             self.embedding_dim = embedding_dim
             self.embedding = nn.Embedding(self.vocab_size, self.embedding_dim, padding_idx=0)
-            # nn.init.xavier_uniform_(self.embedding.weight) # Optional: initialize new embeddings
+            # nn.init.xavier_uniform_(self.embedding.weight) 
         else:
             raise ValueError("Either embedding_matrix or (vocab_size and embedding_dim) must be provided.")
 
         self.n_kernels = n_kernels
 
         # Initialize RBF kernel parameters (mu and sigma)
-        # These are made trainable parameters
         if mu_init is None:
             # Linearly spaced means from -0.9 to 0.9 (covering cosine similarities from near -1 to near 1 after some initial non-linearity)
             # The first kernel is exact match (mu=1.0), others are spread out.
             mus = [-0.9 + (1.8 / (n_kernels - 2)) * i for i in range(n_kernels -1)]
-            mus.append(0.999) # Add a kernel very close to 1.0 for exact matches, as 1.0 can be too restrictive.
+            mus.append(0.999) 
             self.mu = nn.Parameter(torch.tensor(mus, dtype=torch.float32).view(1, 1, 1, n_kernels))
         else:
             if not isinstance(mu_init, torch.Tensor):
@@ -238,10 +237,6 @@ if __name__ == '__main__':
     print(f"Padded Query Mask (first sample, last 10 tokens): {query_mask_padded[0, -10:]}")
     print(f"Output scores (padded) shape: {scores_padded.shape}")
     print(f"Output scores (padded):\n{scores_padded}")
-
-    # Ensure scores for padded inputs are handled correctly (e.g., don't differ wildly due to padding if masks work)
-    # This basic check doesn't guarantee correctness but is a sanity check.
-    # A more rigorous check would involve comparing outputs with and without padding for the same content.
 
     print("\nKNRM Model Structure:")
     print(model)

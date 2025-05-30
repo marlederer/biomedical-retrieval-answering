@@ -10,15 +10,14 @@ import torch
 import json
 from tqdm import tqdm
 import argparse
-# defaultdict removed as full JSON output is commented out
 import requests
 from bs4 import BeautifulSoup
-from concurrent.futures import ThreadPoolExecutor, as_completed # Added import
+from concurrent.futures import ThreadPoolExecutor, as_completed 
 
 import config
 from knrm import KNRM
-from data_loader import fetch_document_content # Assuming this is correctly placed and working
-from utils import Vocabulary, texts_to_sequences, pad_sequence, create_mask_from_sequence, tokenize_text # Updated import
+from data_loader import fetch_document_content 
+from utils import Vocabulary, texts_to_sequences, pad_sequence, create_mask_from_sequence, tokenize_text 
 from metrics import calculate_mrr
 
 def ensure_dir(directory):
@@ -88,7 +87,7 @@ def rerank_documents(
     vocab_path,
     input_retrieval_path, # Path to the output of BM25/Dense (e.g., bioasq_output.json)
     output_reranked_path, # Path to save reranked output (currently commented out)
-    ground_truth_path=None # Optional: path to BioASQ JSON with ground truth for MRR calc
+    ground_truth_path="bioasq_reranker\data\training13b.json" # Optional path to ground truth BioASQ JSON for MRR calculation
 ):
     print(f"Loading vocabulary from {vocab_path}...")
     try:
@@ -132,7 +131,7 @@ def rerank_documents(
         print("No questions found in the input file.")
         return
 
-    # Load ground truth data once if path is provided
+    # Load ground truth data 
     relevant_docs_map_gt = {}
     if ground_truth_path:
         print(f"Loading ground truth from {ground_truth_path}...")
@@ -156,9 +155,6 @@ def rerank_documents(
 
     total_mrr_sum = 0.0
     questions_with_gt_and_docs_count = 0
-    
-    # This list would store per-question outputs if saving the full JSON was enabled
-    # final_bioasq_questions_output = []
 
     print("Starting per-question inference, reranking, and MRR calculation...")
     for question_data in tqdm(questions_to_process, desc="Processing Questions"):
@@ -187,7 +183,7 @@ def rerank_documents(
                 doc_url = future_to_url[future]
                 try:
                     content = future.result()
-                    if content: # Ensure there's some text
+                    if content: 
                         current_question_docs_for_model.append({'url': doc_url, 'text': content, 'query_id': query_id})
                     else:
                         # Log that content couldn't be fetched and this doc is skipped
@@ -203,7 +199,7 @@ def rerank_documents(
             continue
             
         # Tokenize query
-        query_tokens = tokenize_text(query_text, config.TOKENIZER_TYPE) # Corrected line
+        query_tokens = tokenize_text(query_text, config.TOKENIZER_TYPE) 
         # q_ids_tensor, q_mask_tensor = vocab.prepare_tensor(query_tokens, config.MAX_QUERY_LEN, config.DEVICE) # Old problematic line
         query_seq = texts_to_sequences([query_tokens], vocab)[0]
         padded_query_seq = pad_sequence(query_seq, config.MAX_QUERY_LEN, pad_value=vocab.word2idx[vocab.pad_token])
@@ -220,7 +216,7 @@ def rerank_documents(
         doc_ids_list = []
         doc_mask_list = []
         for doc_content in current_question_docs_for_model:
-            doc_tokens = tokenize_text(doc_content['text'], config.TOKENIZER_TYPE) # Corrected line
+            doc_tokens = tokenize_text(doc_content['text'], config.TOKENIZER_TYPE)
             # d_ids_tensor, d_mask_tensor = vocab.prepare_tensor(doc_tokens, config.MAX_DOC_LEN, config.DEVICE) # Old problematic line
             doc_seq = texts_to_sequences([doc_tokens], vocab)[0]
             padded_doc_seq = pad_sequence(doc_seq, config.MAX_DOC_LEN, pad_value=vocab.word2idx[vocab.pad_token])
@@ -246,29 +242,12 @@ def rerank_documents(
         for i, doc_data in enumerate(current_question_docs_for_model):
             scored_docs_for_this_question.append({
                 'doc_id': doc_data['url'], 
-                'doc_text': doc_data['text'], # Keeping text for potential future use / debugging
+                'doc_text': doc_data['text'], 
                 'rerank_score': scores_list[i]
             })
         
         # Sort documents by new rerank_score
         sorted_docs = sorted(scored_docs_for_this_question, key=lambda x: x['rerank_score'], reverse=True)
-
-        # --- (Optional) Reconstruct BioASQ structure for this question for full output file ---
-        # This part is commented out as per the focus on MRR.
-        # question_output_for_json = {
-        #     "id": query_id,
-        #     "body": query_text,
-        #     "documents": [info['doc_id'] for info in sorted_docs],
-        #     "snippets": [
-        #         {
-        #             "document": info['doc_id'],
-        #             "text": info['doc_text'], # Could be fetched or original snippet
-        #             "score_reranked": info['rerank_score']
-        #         } for info in sorted_docs
-        #     ]
-        # }
-        # final_bioasq_questions_output.append(question_output_for_json)
-        # --- End of optional JSON output part ---
 
         # Calculate and print MRR for this question if ground truth is available
         if ground_truth_path and query_id in relevant_docs_map_gt:
@@ -294,16 +273,6 @@ def rerank_documents(
         elif ground_truth_path: # GT was provided, but not for this specific query_id
             print(f"No ground truth found for question {query_id}. Skipping MRR calculation for this question.")
         # If no ground_truth_path, MRR calculation is skipped silently for each question.
-
-    # --- (Optional) Save the full reranked results ---
-    # This part is commented out.
-    # if final_bioasq_questions_output:
-    #     final_bioasq_structure_to_save = {"questions": final_bioasq_questions_output}
-    #     ensure_dir(os.path.dirname(output_reranked_path))
-    #     with open(output_reranked_path, 'w', encoding='utf-8') as f:
-    #         json.dump(final_bioasq_structure_to_save, f, indent=4)
-    #     print(f"Full reranked results saved to {output_reranked_path}")
-    # --- End of optional save part ---
 
     # After processing all questions, print average MRR
     if ground_truth_path: # Only print average if GT was attempted
@@ -350,7 +319,6 @@ if __name__ == '__main__':
     input_file_to_use = args.input_file
     if not os.path.exists(input_file_to_use):
         print(f"Warning: Specified input file {input_file_to_use} not found.")
-        # Try to use one of the default config paths if they exist
         if os.path.exists(config.BM25_OUTPUT_PATH):
             print(f"Using BM25 output from config: {config.BM25_OUTPUT_PATH}")
             input_file_to_use = config.BM25_OUTPUT_PATH
@@ -370,16 +338,15 @@ if __name__ == '__main__':
             with open(input_file_to_use, 'w') as f:
                 json.dump(dummy_retrieval_data, f)
     
-    # Ensure ground truth file exists if specified, or create a dummy one for testing structure
     gt_file_to_use = args.ground_truth_file
     if gt_file_to_use and not os.path.exists(gt_file_to_use):
         if gt_file_to_use == config.TRAIN_DATA_PATH and os.path.exists(config.TRAIN_DATA_PATH):
-            pass # It will use the one from config
+            pass 
         else:
             print(f"Warning: Dummy ground truth data created at {gt_file_to_use} for MRR calculation structure test.")
             dummy_gt_data = {"questions": [
                 {"id": "q1_infer", "body": "test query for inference", "documents": ["doc_url_1"], 
-                 "snippets": [{"text": "sample document one", "document": "doc_url_1"}] # Assuming doc_url_1 is relevant
+                 "snippets": [{"text": "sample document one", "document": "doc_url_1"}] 
                 }
             ]}
             with open(gt_file_to_use, 'w') as f:

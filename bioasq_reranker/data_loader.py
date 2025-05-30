@@ -6,9 +6,9 @@ import json
 import random
 import torch
 from torch.utils.data import Dataset, DataLoader
-import os # Added
-import requests # Ensure this import is present
-from bs4 import BeautifulSoup # Ensure this import is present
+import os 
+import requests 
+from bs4 import BeautifulSoup 
 
 import config
 from utils import tokenize_text, texts_to_sequences, pad_sequence, create_mask_from_sequence, Vocabulary
@@ -158,9 +158,6 @@ def get_dataloaders(vocab, batch_size=config.BATCH_SIZE, num_neg_samples_train=1
         print(f"Hard negatives file not found at {config.HARD_NEGATIVES_PATH}. Using random negatives only.")
 
     # Create training triples
-    # You might want to split your bioasq_questions into train and validation sets first
-    # For this example, we'll use a subset for validation if the data is large enough, or just reuse.
-    
     # Simple split for example: 80% train, 20% val
     random.shuffle(train_questions_raw)
     split_idx = int(len(train_questions_raw) * 0.8)
@@ -234,7 +231,7 @@ class BioASQPredictionDataset(Dataset):
             'query_mask': torch.tensor(q_mask, dtype=torch.float32),
             'doc_ids': torch.tensor(d_padded, dtype=torch.long),
             'doc_mask': torch.tensor(d_mask, dtype=torch.float32),
-            'original_query': query_text, # Keep original for grouping results
+            'original_query': query_text, 
             'original_doc': doc_text
         }
 
@@ -301,8 +298,6 @@ def load_first_stage_rerank_data(filepath, vocab, fetch_content=False):
     Expected format: A list of questions, each with a 'body' (query) and 'documents' (list of URLs/IDs) 
                      and 'snippets' (list of text snippets corresponding to documents).
                      The reranker will typically rerank these snippets.
-    Or, a simpler list of {query_id: str, query_text: str, candidates: [{doc_id: str, doc_text: str, score: float}, ...]}
-    This function adapts to the BM25/Dense output structure you provided.
 
     Args:
         filepath (str): Path to the first-stage ranker output file.
@@ -322,16 +317,12 @@ def load_first_stage_rerank_data(filepath, vocab, fetch_content=False):
         query_id = question_item.get('id')
         
         # Assuming snippets are the candidates to rerank
-        # And that the `documents` list in BM25/Dense output corresponds to these snippets by order/URI.
-        # The `snippets` themselves contain the text.
-        # snippets = question_item.get('snippets', []) # Original line
-        document_urls = question_item.get('documents', []) # Use the full list of document URLs
+        document_urls = question_item.get('documents', [])
         
         # if not query_text or not snippets: # Original line
         if not query_text or not document_urls:
             continue
 
-        # for snippet_data in snippets: # Original line
         # Limit to top 100 as per user request, though input file already has top 100
         for doc_url in document_urls[:100]: 
             doc_text_to_use = None
@@ -342,9 +333,6 @@ def load_first_stage_rerank_data(filepath, vocab, fetch_content=False):
                     doc_text_to_use = fetched_text
                 else:
                     print(f"Warning: Could not fetch content for {doc_url}. Skipping this document for query {query_id}.")
-                    # Fallback to snippet text if fetching fails, though the user wants full text
-                    # This part needs to align with how snippets are structured if we want a fallback
-                    # For now, if fetch fails and no snippet, it will be skipped.
                     corresponding_snippet = next((s for s in question_item.get('snippets', []) if s.get('document') == doc_url), None)
                     if corresponding_snippet and corresponding_snippet.get('text'):
                         print(f"Falling back to snippet text for {doc_url}")
@@ -353,8 +341,6 @@ def load_first_stage_rerank_data(filepath, vocab, fetch_content=False):
                         print(f"No content fetched and no fallback snippet text for {doc_url}. Skipping.")
                         continue # Skip if no content could be obtained
             else:
-                # Fallback to using snippet text if fetch_content is False or if not implemented yet
-                # This requires matching doc_url to snippet_data['document']
                 corresponding_snippet = next((s for s in question_item.get('snippets', []) if s.get('document') == doc_url), None)
                 if corresponding_snippet and corresponding_snippet.get('text'):
                     doc_text_to_use = corresponding_snippet.get('text')
@@ -436,7 +422,6 @@ if __name__ == '__main__':
 
     # --- Inference DataLoader Example --- #
     print("\n--- Inference DataLoader Example (using BM25 output) ---")
-    # Ensure BM25_OUTPUT_PATH in config.py points to a valid BM25 output file
     # Create a dummy BM25 output if it doesn't exist for testing
     dummy_bm25_output_path = config.BM25_OUTPUT_PATH
     # Ensure the dummy file actually exists for the example to run without error if config.BM25_OUTPUT_PATH is used.
